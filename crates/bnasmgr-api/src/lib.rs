@@ -239,6 +239,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/users/:id/role", post(update_user_role))
         .route("/api/users/:id/reset-password", post(reset_user_password))
         .route("/api/storage/overview", get(storage_overview))
+        .route("/api/storage/disks", get(disk_health))
         .route("/api/storage/quota", post(set_quota))
         .route("/api/storage/pools/:pool/scrub", get(pool_scrub_status))
         .route(
@@ -979,6 +980,19 @@ async fn storage_overview(
         .helper(&user.username, HelperOperation::ListStorage)
         .await?;
     Ok(Json(data))
+}
+
+async fn disk_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::ListSmartDisks)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -2408,6 +2422,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn disk_health_is_exposed_to_admins() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/storage/disks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let disks: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(disks[0]["state"], "ok");
     }
 
     #[tokio::test]

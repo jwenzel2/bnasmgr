@@ -21,6 +21,7 @@ pub enum ServiceAction {
 #[serde(rename_all = "snake_case")]
 pub enum HelperOperation {
     ListStorage,
+    ListSmartDisks,
     PoolScrubStatus {
         pool: String,
     },
@@ -192,6 +193,16 @@ impl HelperClient for MockHelper {
                         {"name":"tank/backups","used":"410G","available":"1.4T","quota":"2T","mountpoint":"/mnt/tank/backups","health":"online","snapshots":31}
                     ]
                 }),
+            },
+            HelperOperation::ListSmartDisks => HelperResponse {
+                ok: true,
+                category: "disk_health".into(),
+                target: "all".into(),
+                message: "mock disk health loaded".into(),
+                data: serde_json::json!([
+                    {"name":"/dev/ada0","device_type":"ata","model":"Mock SSD","serial":"MOCK0001","smart_status":"passed","state":"ok"},
+                    {"name":"/dev/ada1","device_type":"ata","model":"Mock HDD","serial":"MOCK0002","smart_status":"passed","state":"ok"}
+                ]),
             },
             HelperOperation::PoolScrubStatus { pool } => HelperResponse {
                 ok: true,
@@ -480,6 +491,7 @@ impl FreeBsdCommandBuilder {
                 "-o".into(),
                 "name,used,avail,quota,mountpoint".into(),
             ],
+            HelperOperation::ListSmartDisks => vec!["smartctl".into(), "--scan".into()],
             HelperOperation::PoolScrubStatus { pool } => {
                 safe_arg(pool)?;
                 vec!["zpool".into(), "status".into(), pool.clone()]
@@ -697,6 +709,7 @@ impl HelperClient for FreeBsdHelper {
         let operation = request.operation;
         match &operation {
             HelperOperation::ListStorage => return freebsd_storage_overview().await,
+            HelperOperation::ListSmartDisks => return freebsd_smart_disks().await,
             HelperOperation::PoolScrubStatus { .. } => {
                 return freebsd_pool_scrub_status(&operation).await
             }
@@ -856,6 +869,46 @@ async fn freebsd_storage_overview() -> Result<HelperResponse, HelperError> {
             "pools": pool_rows,
             "datasets": dataset_rows,
         }),
+    })
+}
+
+async fn freebsd_smart_disks() -> Result<HelperResponse, HelperError> {
+    let scan = run_command(FreeBsdCommandBuilder::build(
+        &HelperOperation::ListSmartDisks,
+    )?)
+    .await?;
+    if !scan.ok {
+        return Ok(HelperResponse {
+            ok: false,
+            category: "disk_health".into(),
+            target: "all".into(),
+            message: scan.stderr,
+            data: serde_json::json!([]),
+        });
+    }
+    let mut disks = Vec::new();
+    for device in parse_smartctl_scan(&scan.stdout).into_iter().take(32) {
+        let mut cmd = vec!["smartctl".into(), "-H".into(), "-i".into()];
+        if let Some(device_type) = &device.device_type {
+            cmd.push("-d".into());
+            cmd.push(device_type.clone());
+        }
+        cmd.push(device.name.clone());
+        let output = run_command(cmd).await?;
+        disks.push(parse_smartctl_health(
+            &device.name,
+            device.device_type.as_deref(),
+            &output.stdout,
+            &output.stderr,
+            output.ok,
+        ));
+    }
+    Ok(HelperResponse {
+        ok: true,
+        category: "disk_health".into(),
+        target: "all".into(),
+        message: "disk health loaded".into(),
+        data: serde_json::json!(disks),
     })
 }
 
@@ -1447,6 +1500,105 @@ fn parse_zpool_scrub_status(stdout: &str) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmartDevice {
+    name: String,
+    device_type: Option<String>,
+}
+
+fn parse_smartctl_scan(stdout: &str) -> Vec<SmartDevice> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?.to_string();
+            if !name.starts_with("/dev/") {
+                return None;
+            }
+            let mut device_type = None;
+            while let Some(part) = parts.next() {
+                if part == "-d" {
+                    device_type = parts
+                        .next()
+                        .map(|value| value.trim_end_matches(',').to_string());
+                    break;
+                }
+            }
+            Some(SmartDevice { name, device_type })
+        })
+        .collect()
+}
+
+fn parse_smartctl_health(
+    name: &str,
+    device_type: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+    ok: bool,
+) -> serde_json::Value {
+    let model = first_smart_value(
+        stdout,
+        &[
+            "Device Model:",
+            "Product:",
+            "Model Number:",
+            "Vendor:",
+            "Model Family:",
+        ],
+    )
+    .unwrap_or_else(|| "unknown".into());
+    let serial = first_smart_value(stdout, &["Serial Number:"]).unwrap_or_else(|| "unknown".into());
+    let status = first_smart_value(
+        stdout,
+        &[
+            "SMART overall-health self-assessment test result:",
+            "SMART Health Status:",
+        ],
+    )
+    .unwrap_or_else(|| {
+        if ok {
+            "unknown".into()
+        } else {
+            stderr
+                .lines()
+                .next()
+                .unwrap_or("smartctl failed")
+                .to_string()
+        }
+    });
+    let lower = status.to_ascii_lowercase();
+    let state = if lower.contains("passed") || lower == "ok" {
+        "ok"
+    } else if lower.contains("fail") || lower.contains("bad") {
+        "fail"
+    } else if ok {
+        "unknown"
+    } else {
+        "warn"
+    };
+    serde_json::json!({
+        "name": name,
+        "device_type": device_type.unwrap_or("auto"),
+        "model": model,
+        "serial": serial,
+        "smart_status": status,
+        "state": state,
+    })
+}
+
+fn first_smart_value(stdout: &str, keys: &[&str]) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let trimmed = line.trim();
+        keys.iter().find_map(|key| {
+            trimmed
+                .strip_prefix(key)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
 fn parse_snapshot_counts(stdout: &str) -> BTreeMap<String, u32> {
     let mut counts = BTreeMap::new();
     for line in stdout.lines() {
@@ -1652,6 +1804,7 @@ fn parse_log_timestamp(line: &str) -> Option<DateTime<Utc>> {
 pub fn operation_category_target(operation: &HelperOperation) -> (String, String) {
     match operation {
         HelperOperation::ListStorage => ("storage".into(), "overview".into()),
+        HelperOperation::ListSmartDisks => ("disk_health".into(), "all".into()),
         HelperOperation::PoolScrubStatus { pool }
         | HelperOperation::PoolScrubAction { pool, .. } => ("pool_scrub".into(), pool.clone()),
         HelperOperation::ListSnapshots { dataset } => (
@@ -1742,6 +1895,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(stop, vec!["zpool", "scrub", "-s", "tank"]);
+    }
+
+    #[test]
+    fn smart_disk_scan_command_is_read_only() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ListSmartDisks).unwrap();
+        assert_eq!(cmd, vec!["smartctl", "--scan"]);
     }
 
     #[test]
@@ -1875,6 +2034,30 @@ mod tests {
             "  pool: tank\n state: ONLINE\n  scan: scrub repaired 0B in 00:12:14 with 0 errors on Tue May 19 12:12:14 2026\n",
         );
         assert_eq!(finished["state"], "finished");
+    }
+
+    #[test]
+    fn parses_smartctl_scan_and_health() {
+        let devices = parse_smartctl_scan(
+            "/dev/ada0 -d atacam # /dev/ada0, ATA device\n/dev/nvme0 -d nvme # NVMe device\n",
+        );
+        assert_eq!(
+            devices[0],
+            SmartDevice {
+                name: "/dev/ada0".into(),
+                device_type: Some("atacam".into())
+            }
+        );
+        let health = parse_smartctl_health(
+            "/dev/ada0",
+            Some("atacam"),
+            "Device Model:     Example SSD\nSerial Number:    ABC123\nSMART overall-health self-assessment test result: PASSED\n",
+            "",
+            true,
+        );
+        assert_eq!(health["state"], "ok");
+        assert_eq!(health["model"], "Example SSD");
+        assert_eq!(health["serial"], "ABC123");
     }
 
     #[test]

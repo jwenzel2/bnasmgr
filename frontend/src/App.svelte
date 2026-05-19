@@ -8,6 +8,7 @@
   let passwordForm = { current_password: 'admin', new_password: '' };
   let storage = { pools: [], datasets: [] };
   let scrubStatus = {};
+  let disks = [];
   let snapshots = [];
   let snapshotTasks = [];
   let services = [];
@@ -61,7 +62,7 @@
 
   async function loadAll() {
     if (!token || user?.must_change_password) return;
-    await Promise.all([loadStorage(), loadSnapshots(), loadSnapshotTasks(), loadServices(), loadShares(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
+    await Promise.all([loadStorage(), loadDiskHealth(), loadSnapshots(), loadSnapshotTasks(), loadServices(), loadShares(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
   }
 
   async function restoreSession() {
@@ -83,6 +84,14 @@
   async function loadScrubStatuses() {
     const entries = await Promise.all(storage.pools.map(async (pool) => [pool.name, await request(`/api/storage/pools/${encodeURIComponent(pool.name)}/scrub`)]));
     scrubStatus = Object.fromEntries(entries);
+  }
+
+  async function loadDiskHealth() {
+    try {
+      disks = await request('/api/storage/disks');
+    } catch {
+      disks = [];
+    }
   }
 
   async function scrubAction(pool, action) {
@@ -408,6 +417,24 @@
             </article>
           {/each}
         </section>
+        {#if disks.length}
+          <section class="panel disk-panel">
+            <h2>Disk health</h2>
+            <table>
+              <tbody>
+                {#each disks as disk}
+                  <tr>
+                    <td>{disk.name}</td>
+                    <td>{disk.model}</td>
+                    <td>{disk.serial}</td>
+                    <td>{disk.device_type}</td>
+                    <td><span class="status {disk.state === 'ok' ? 'green' : disk.state === 'fail' ? 'red' : 'yellow'}">{disk.smart_status}</span></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </section>
+        {/if}
       {:else if active === 'snapshots'}
         <section class="panel">
           <form class="inline" on:submit|preventDefault={createSnapshot}>
