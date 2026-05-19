@@ -7,6 +7,7 @@
   let loginForm = { username: 'admin', password: 'admin' };
   let passwordForm = { current_password: 'admin', new_password: '' };
   let storage = { pools: [], datasets: [] };
+  let scrubStatus = {};
   let snapshots = [];
   let snapshotTasks = [];
   let services = [];
@@ -76,6 +77,17 @@
 
   async function loadStorage() {
     storage = await request('/api/storage/overview');
+    await loadScrubStatuses();
+  }
+
+  async function loadScrubStatuses() {
+    const entries = await Promise.all(storage.pools.map(async (pool) => [pool.name, await request(`/api/storage/pools/${encodeURIComponent(pool.name)}/scrub`)]));
+    scrubStatus = Object.fromEntries(entries);
+  }
+
+  async function scrubAction(pool, action) {
+    await request(`/api/storage/pools/${encodeURIComponent(pool)}/scrub/${action}`, { method: 'POST' });
+    await loadScrubStatuses();
   }
 
   async function setQuota(dataset, event) {
@@ -364,6 +376,14 @@
               <div class="usage-legend">
                 <span><i class="used"></i>Used {usage(pool).used}</span>
                 <span><i class="free"></i>Free {usage(pool).free}</span>
+              </div>
+              <div class="scrub-status">
+                <span class="status {scrubStatus[pool.name]?.state === 'running' ? 'yellow' : 'green'}">{scrubStatus[pool.name]?.state || 'unknown'}</span>
+                <p>{scrubStatus[pool.name]?.message || 'scrub status unavailable'}</p>
+                <div class="actions">
+                  <button on:click={() => scrubAction(pool.name, 'start')}>Start scrub</button>
+                  <button on:click={() => scrubAction(pool.name, 'stop')}>Stop scrub</button>
+                </div>
               </div>
             </article>
           {/each}

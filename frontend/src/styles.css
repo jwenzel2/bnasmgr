@@ -81,7 +81,14 @@ header { display: flex; justify-content: space-between; align-items: center; mar
   gap: 16px;
   align-items: center;
 }
-.pool-card .usage-legend { grid-column: 1 / -1; }
+.pool-card .usage-legend, .pool-card .scrub-status { grid-column: 1 / -1; }
+.scrub-status {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid #e1e7e4;
+  padding-top: 12px;
+}
+.scrub-status p { margin: 0; color: #35443c; overflow-wrap: anywhere; }
 .card-heading {
   display: grid;
   grid-template-columns: 1fr 84px;

@@ -10,7 +10,8 @@ use axum::{
     Json, Router,
 };
 use bnasmgr_helper::{
-    allowed_service, valid_quota, HelperClient, HelperOperation, HelperRequest, ServiceAction,
+    allowed_service, valid_quota, HelperClient, HelperOperation, HelperRequest, PoolScrubAction,
+    ServiceAction,
 };
 use chrono::{DateTime, Utc};
 use rand_core::OsRng;
@@ -239,6 +240,11 @@ pub fn app(state: AppState) -> Router {
         .route("/api/users/:id/reset-password", post(reset_user_password))
         .route("/api/storage/overview", get(storage_overview))
         .route("/api/storage/quota", post(set_quota))
+        .route("/api/storage/pools/:pool/scrub", get(pool_scrub_status))
+        .route(
+            "/api/storage/pools/:pool/scrub/:action",
+            post(pool_scrub_action),
+        )
         .route("/api/snapshots", get(list_snapshots).post(create_snapshot))
         .route(
             "/api/snapshots/tasks",
@@ -462,6 +468,14 @@ fn validate_dataset_name(dataset: &str) -> Result<(), ApiError> {
     reject_shell_chars(dataset, "dataset")?;
     if dataset.starts_with('/') || dataset.contains("..") || dataset.contains('@') {
         return Err(ApiError::bad_request("dataset name is not valid"));
+    }
+    Ok(())
+}
+
+fn validate_pool_name(pool: &str) -> Result<(), ApiError> {
+    reject_shell_chars(pool, "pool")?;
+    if pool.contains('/') || pool.contains('@') || pool.contains("..") {
+        return Err(ApiError::bad_request("pool name is not valid"));
     }
     Ok(())
 }
@@ -990,6 +1004,48 @@ async fn set_quota(
                     dataset: body.dataset,
                     quota: body.quota,
                 },
+            )
+            .await?,
+    ))
+}
+
+async fn pool_scrub_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(pool): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    validate_pool_name(&pool)?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::PoolScrubStatus { pool })
+            .await?,
+    ))
+}
+
+async fn pool_scrub_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((pool, action)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_pool_name(&pool)?;
+    let action = match action.as_str() {
+        "start" => PoolScrubAction::Start,
+        "stop" => PoolScrubAction::Stop,
+        _ => {
+            return Err(ApiError::bad_request(
+                "pool scrub action must be start or stop",
+            ))
+        }
+    };
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::PoolScrubAction { pool, action },
             )
             .await?,
     ))
@@ -2297,6 +2353,54 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/services/sshd/restart")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pool_scrub_actions_are_validated() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/storage/pools/tank/scrub")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["state"], "idle");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/storage/pools/tank/scrub/start")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/storage/pools/tank/scrub/reboot")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),

@@ -21,6 +21,13 @@ pub enum ServiceAction {
 #[serde(rename_all = "snake_case")]
 pub enum HelperOperation {
     ListStorage,
+    PoolScrubStatus {
+        pool: String,
+    },
+    PoolScrubAction {
+        pool: String,
+        action: PoolScrubAction,
+    },
     ListSnapshots {
         dataset: Option<String>,
     },
@@ -93,6 +100,13 @@ pub enum HelperOperation {
         snapshot: String,
         files: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolScrubAction {
+    Start,
+    Stop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +192,24 @@ impl HelperClient for MockHelper {
                         {"name":"tank/backups","used":"410G","available":"1.4T","quota":"2T","mountpoint":"/mnt/tank/backups","health":"online","snapshots":31}
                     ]
                 }),
+            },
+            HelperOperation::PoolScrubStatus { pool } => HelperResponse {
+                ok: true,
+                category: "pool_scrub".into(),
+                target: pool,
+                message: "mock scrub status loaded".into(),
+                data: serde_json::json!({
+                    "state": "idle",
+                    "message": "no scrub in progress",
+                    "last_scrub": "scrub repaired 0B in 00:12:14 with 0 errors"
+                }),
+            },
+            HelperOperation::PoolScrubAction { pool, action } => HelperResponse {
+                ok: true,
+                category: "pool_scrub".into(),
+                target: pool,
+                message: format!("scrub {action:?} requested"),
+                data: serde_json::json!({ "state": if action == PoolScrubAction::Start { "running" } else { "idle" } }),
             },
             HelperOperation::ListSnapshots { dataset } => {
                 let ds = dataset.unwrap_or_else(|| "tank/media".into());
@@ -448,6 +480,19 @@ impl FreeBsdCommandBuilder {
                 "-o".into(),
                 "name,used,avail,quota,mountpoint".into(),
             ],
+            HelperOperation::PoolScrubStatus { pool } => {
+                safe_arg(pool)?;
+                vec!["zpool".into(), "status".into(), pool.clone()]
+            }
+            HelperOperation::PoolScrubAction { pool, action } => {
+                safe_arg(pool)?;
+                match action {
+                    PoolScrubAction::Start => vec!["zpool".into(), "scrub".into(), pool.clone()],
+                    PoolScrubAction::Stop => {
+                        vec!["zpool".into(), "scrub".into(), "-s".into(), pool.clone()]
+                    }
+                }
+            }
             HelperOperation::ListSnapshots { dataset } => {
                 if let Some(dataset) = dataset {
                     safe_arg(dataset)?;
@@ -652,6 +697,9 @@ impl HelperClient for FreeBsdHelper {
         let operation = request.operation;
         match &operation {
             HelperOperation::ListStorage => return freebsd_storage_overview().await,
+            HelperOperation::PoolScrubStatus { .. } => {
+                return freebsd_pool_scrub_status(&operation).await
+            }
             HelperOperation::ListSnapshots { .. } => return freebsd_snapshots(&operation).await,
             HelperOperation::ServiceStatus { .. } => {
                 return freebsd_service_status(&operation).await
@@ -827,6 +875,28 @@ async fn freebsd_snapshots(operation: &HelperOperation) -> Result<HelperResponse
         data: if output.ok {
             serde_json::to_value(parse_zfs_snapshots(&output.stdout))
                 .unwrap_or_else(|_| serde_json::json!([]))
+        } else {
+            serde_json::json!({})
+        },
+    })
+}
+
+async fn freebsd_pool_scrub_status(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(operation)?).await?;
+    let (category, target) = operation_category_target(operation);
+    Ok(HelperResponse {
+        ok: output.ok,
+        category,
+        target,
+        message: if output.ok {
+            "pool scrub status loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            parse_zpool_scrub_status(&output.stdout)
         } else {
             serde_json::json!({})
         },
@@ -1353,6 +1423,30 @@ fn parse_zpool_list(stdout: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn parse_zpool_scrub_status(stdout: &str) -> serde_json::Value {
+    let scan = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("scan:"))
+        .unwrap_or("scan: none requested")
+        .trim_start_matches("scan:")
+        .trim();
+    let state = if scan.contains("scrub in progress") || scan.contains("resilver in progress") {
+        "running"
+    } else if scan.contains("scrub canceled") {
+        "canceled"
+    } else if scan.contains("repaired") || scan.contains("scrub repaired") {
+        "finished"
+    } else {
+        "idle"
+    };
+    serde_json::json!({
+        "state": state,
+        "message": scan,
+        "last_scrub": scan,
+    })
+}
+
 fn parse_snapshot_counts(stdout: &str) -> BTreeMap<String, u32> {
     let mut counts = BTreeMap::new();
     for line in stdout.lines() {
@@ -1558,6 +1652,8 @@ fn parse_log_timestamp(line: &str) -> Option<DateTime<Utc>> {
 pub fn operation_category_target(operation: &HelperOperation) -> (String, String) {
     match operation {
         HelperOperation::ListStorage => ("storage".into(), "overview".into()),
+        HelperOperation::PoolScrubStatus { pool }
+        | HelperOperation::PoolScrubAction { pool, .. } => ("pool_scrub".into(), pool.clone()),
         HelperOperation::ListSnapshots { dataset } => (
             "snapshot".into(),
             dataset.clone().unwrap_or_else(|| "all".into()),
@@ -1623,6 +1719,29 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("invalid quota") || err.to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn pool_scrub_commands_are_limited_to_zpool_scrub() {
+        let status = FreeBsdCommandBuilder::build(&HelperOperation::PoolScrubStatus {
+            pool: "tank".into(),
+        })
+        .unwrap();
+        assert_eq!(status, vec!["zpool", "status", "tank"]);
+
+        let start = FreeBsdCommandBuilder::build(&HelperOperation::PoolScrubAction {
+            pool: "tank".into(),
+            action: PoolScrubAction::Start,
+        })
+        .unwrap();
+        assert_eq!(start, vec!["zpool", "scrub", "tank"]);
+
+        let stop = FreeBsdCommandBuilder::build(&HelperOperation::PoolScrubAction {
+            pool: "tank".into(),
+            action: PoolScrubAction::Stop,
+        })
+        .unwrap();
+        assert_eq!(stop, vec!["zpool", "scrub", "-s", "tank"]);
     }
 
     #[test]
@@ -1743,6 +1862,19 @@ mod tests {
         assert_eq!(datasets[0]["name"], "tank/media");
         assert_eq!(datasets[0]["health"], "online");
         assert_eq!(datasets[0]["snapshots"], 2);
+    }
+
+    #[test]
+    fn parses_pool_scrub_status() {
+        let running = parse_zpool_scrub_status(
+            "  pool: tank\n state: ONLINE\n  scan: scrub in progress since Tue May 19 12:00:00 2026\n",
+        );
+        assert_eq!(running["state"], "running");
+
+        let finished = parse_zpool_scrub_status(
+            "  pool: tank\n state: ONLINE\n  scan: scrub repaired 0B in 00:12:14 with 0 errors on Tue May 19 12:12:14 2026\n",
+        );
+        assert_eq!(finished["state"], "finished");
     }
 
     #[test]
