@@ -3,7 +3,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use bnasmgr_api::{app, AppState};
 use bnasmgr_helper::{MockHelper, UnixSocketHelper};
 use sqlx::sqlite::SqlitePoolOptions;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -36,6 +36,25 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool, helper);
     state.migrate().await?;
     state.seed_admin().await?;
+    if std::env::var("BNASMGR_SNAPSHOT_SCHEDULER").as_deref() != Ok("off") {
+        let scheduler_state = state.clone();
+        let interval_seconds = std::env::var("BNASMGR_SNAPSHOT_SCHEDULER_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 10)
+            .unwrap_or(60);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+            loop {
+                interval.tick().await;
+                match scheduler_state.run_due_snapshot_tasks().await {
+                    Ok(ran) if ran > 0 => tracing::info!(ran, "scheduled snapshot tasks ran"),
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(?err, "scheduled snapshot task scan failed"),
+                }
+            }
+        });
+    }
 
     let addr: SocketAddr = bind.parse().context("parse BNASMGR_BIND")?;
     let router = app(state);

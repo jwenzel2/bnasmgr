@@ -98,10 +98,31 @@ impl AppState {
                 retention_count integer not null,
                 enabled integer not null,
                 created_at text not null,
-                updated_at text not null
+                updated_at text not null,
+                last_run_at text
             )",
         ] {
             sqlx::query(sql).execute(&self.db).await?;
+        }
+        self.ensure_column("snapshot_tasks", "last_run_at", "text")
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_column(
+        &self,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> anyhow::Result<()> {
+        let pragma = format!("pragma table_info({table})");
+        let columns = sqlx::query(&pragma).fetch_all(&self.db).await?;
+        let exists = columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == column);
+        if !exists {
+            let sql = format!("alter table {table} add column {column} {definition}");
+            sqlx::query(&sql).execute(&self.db).await?;
         }
         Ok(())
     }
@@ -180,6 +201,29 @@ impl AppState {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+
+    pub async fn run_due_snapshot_tasks(&self) -> Result<usize, ApiError> {
+        let rows = sqlx::query("select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at, last_run_at from snapshot_tasks where enabled = 1 order by dataset, prefix")
+            .fetch_all(&self.db)
+            .await?;
+        let now = Utc::now();
+        let mut ran = 0;
+        for row in rows {
+            let task = row_to_snapshot_task(row);
+            if snapshot_task_due(&task, now) {
+                match execute_snapshot_task(self, "scheduler", &task).await {
+                    Ok(_) => ran += 1,
+                    Err(err) => tracing::warn!(
+                        task_id = %task.id,
+                        dataset = %task.dataset,
+                        error = %err.message,
+                        "scheduled snapshot task failed"
+                    ),
+                }
+            }
+        }
+        Ok(ran)
     }
 }
 
@@ -1015,6 +1059,7 @@ struct SnapshotTask {
     enabled: bool,
     created_at: String,
     updated_at: String,
+    last_run_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1033,7 +1078,29 @@ fn row_to_snapshot_task(row: sqlx::sqlite::SqliteRow) -> SnapshotTask {
         enabled: row.get::<i64, _>("enabled") == 1,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+        last_run_at: row.get("last_run_at"),
     }
+}
+
+fn snapshot_task_due(task: &SnapshotTask, now: DateTime<Utc>) -> bool {
+    if !task.enabled {
+        return false;
+    }
+    let Some(last_run_at) = &task.last_run_at else {
+        return true;
+    };
+    let Ok(last_run_at) = DateTime::parse_from_rfc3339(last_run_at) else {
+        return true;
+    };
+    let elapsed = now.signed_duration_since(last_run_at.with_timezone(&Utc));
+    let cadence = match task.cadence.as_str() {
+        "hourly" => chrono::Duration::hours(1),
+        "daily" => chrono::Duration::days(1),
+        "weekly" => chrono::Duration::weeks(1),
+        "monthly" => chrono::Duration::days(30),
+        _ => return false,
+    };
+    elapsed >= cadence
 }
 
 #[derive(Deserialize)]
@@ -1051,7 +1118,7 @@ async fn list_snapshot_tasks(
 ) -> Result<Json<Vec<SnapshotTask>>, ApiError> {
     let user = auth(&headers, &state).await?;
     require_admin(&user)?;
-    let rows = sqlx::query("select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at from snapshot_tasks order by dataset, prefix")
+    let rows = sqlx::query("select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at, last_run_at from snapshot_tasks order by dataset, prefix")
         .fetch_all(&state.db)
         .await?;
     Ok(Json(rows.into_iter().map(row_to_snapshot_task).collect()))
@@ -1083,6 +1150,7 @@ async fn create_snapshot_task(
         enabled: body.enabled,
         created_at: now.clone(),
         updated_at: now,
+        last_run_at: None,
     };
     sqlx::query("insert into snapshot_tasks (id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&task.id)
@@ -1140,7 +1208,7 @@ async fn run_snapshot_task(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = auth(&headers, &state).await?;
     require_privileged(&user)?;
-    let row = sqlx::query("select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at from snapshot_tasks where id = ?")
+    let row = sqlx::query("select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at, last_run_at from snapshot_tasks where id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?
@@ -1149,12 +1217,21 @@ async fn run_snapshot_task(
     if !task.enabled {
         return Err(ApiError::bad_request("snapshot task is disabled"));
     }
+    let data = execute_snapshot_task(&state, &user.username, &task).await?;
+    Ok(Json(data))
+}
+
+async fn execute_snapshot_task(
+    state: &AppState,
+    actor: &str,
+    task: &SnapshotTask,
+) -> Result<serde_json::Value, ApiError> {
     let label = format!("{}-{}", task.prefix, Utc::now().format("%Y%m%d-%H%M%S"));
     validate_snapshot_label(&label)?;
     let created_snapshot = format!("{}@{}", task.dataset, label);
     let created = state
         .helper(
-            &user.username,
+            actor,
             HelperOperation::CreateSnapshot {
                 dataset: task.dataset.clone(),
                 name: label,
@@ -1162,11 +1239,17 @@ async fn run_snapshot_task(
         )
         .await?;
     let retention_deleted =
-        enforce_snapshot_task_retention(&state, &user.username, &task, &created_snapshot).await?;
-    Ok(Json(serde_json::json!({
+        enforce_snapshot_task_retention(state, actor, task, &created_snapshot).await?;
+    sqlx::query("update snapshot_tasks set last_run_at = ?, updated_at = ? where id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(&task.id)
+        .execute(&state.db)
+        .await?;
+    Ok(serde_json::json!({
         "created": created,
         "retention_deleted": retention_deleted,
-    })))
+    }))
 }
 
 async fn enforce_snapshot_task_retention(
@@ -1985,6 +2068,32 @@ mod tests {
         let legacy = legacy_hash_password("admin");
         assert!(is_legacy_password_hash(&legacy));
         assert!(verify_password(&legacy, "admin"));
+    }
+
+    #[test]
+    fn snapshot_task_due_respects_cadence() {
+        let now = Utc::now();
+        let mut task = SnapshotTask {
+            id: "task".into(),
+            dataset: "tank/media".into(),
+            prefix: "daily".into(),
+            cadence: "daily".into(),
+            retention_count: 14,
+            enabled: true,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            last_run_at: None,
+        };
+        assert!(snapshot_task_due(&task, now));
+
+        task.last_run_at = Some((now - chrono::Duration::hours(23)).to_rfc3339());
+        assert!(!snapshot_task_due(&task, now));
+
+        task.last_run_at = Some((now - chrono::Duration::hours(25)).to_rfc3339());
+        assert!(snapshot_task_due(&task, now));
+
+        task.enabled = false;
+        assert!(!snapshot_task_due(&task, now));
     }
 
     #[tokio::test]

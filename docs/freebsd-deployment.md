@@ -97,6 +97,8 @@ service bnasmgr start
 
 The daemon flag is a deployment placeholder for the rc script. If supervised directly by `daemon(8)` or another runner, adapt `command_args` accordingly.
 
+Snapshot task scheduling is enabled in the API process by default. Set `BNASMGR_SNAPSHOT_SCHEDULER=off` to disable it, or set `BNASMGR_SNAPSHOT_SCHEDULER_SECONDS=60` to control how often the API scans for due tasks. Values below 10 seconds are ignored.
+
 ## HTTPS
 
 Use a certificate issued by an internal CA or ACME DNS challenge for the NAS hostname. Do not expose the dashboard over plain HTTP on the LAN.

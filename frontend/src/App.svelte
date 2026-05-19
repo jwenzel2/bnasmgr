@@ -126,7 +126,7 @@
 
   async function runSnapshotTask(id) {
     await request(`/api/snapshots/tasks/${encodeURIComponent(id)}/run`, { method: 'POST' });
-    await loadSnapshots();
+    await Promise.all([loadSnapshots(), loadSnapshotTasks()]);
   }
 
   async function deleteSnapshot(name) {
@@ -420,6 +420,7 @@
                     <td>{task.cadence}</td>
                     <td>keep {task.retention_count}</td>
                     <td>{task.enabled ? 'enabled' : 'disabled'}</td>
+                    <td>{task.last_run_at || 'never run'}</td>
                     <td><button disabled={!task.enabled} on:click={() => runSnapshotTask(task.id)}>Run now</button><button on:click={() => deleteSnapshotTask(task.id, task.prefix)}>Delete</button></td>
                   </tr>
                 {/each}
