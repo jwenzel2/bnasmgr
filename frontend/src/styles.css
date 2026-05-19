@@ -174,6 +174,12 @@ button:disabled {
 }
 .share-list span { overflow-wrap: anywhere; }
 .restore-search { margin-top: 18px; }
+.subpanel {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid #e1e7e4;
+}
+.subpanel h2 { margin-bottom: 12px; }
 .restore-list {
   display: grid;
   gap: 8px;

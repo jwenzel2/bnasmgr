@@ -90,6 +90,16 @@ impl AppState {
                 key text primary key,
                 value text not null
             )",
+            "create table if not exists snapshot_tasks (
+                id text primary key,
+                dataset text not null,
+                prefix text not null,
+                cadence text not null,
+                retention_count integer not null,
+                enabled integer not null,
+                created_at text not null,
+                updated_at text not null
+            )",
         ] {
             sqlx::query(sql).execute(&self.db).await?;
         }
@@ -186,6 +196,12 @@ pub fn app(state: AppState) -> Router {
         .route("/api/storage/overview", get(storage_overview))
         .route("/api/storage/quota", post(set_quota))
         .route("/api/snapshots", get(list_snapshots).post(create_snapshot))
+        .route(
+            "/api/snapshots/tasks",
+            get(list_snapshot_tasks).post(create_snapshot_task),
+        )
+        .route("/api/snapshots/tasks/:id", delete(delete_snapshot_task))
+        .route("/api/snapshots/tasks/:id/run", post(run_snapshot_task))
         .route("/api/snapshots/:snapshot/files", get(search_snapshot_files))
         .route(
             "/api/snapshots/:snapshot/files/restore",
@@ -428,6 +444,29 @@ fn validate_snapshot_label(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_snapshot_prefix(prefix: &str) -> Result<(), ApiError> {
+    reject_shell_chars(prefix, "snapshot prefix")?;
+    if prefix.len() > 48
+        || !prefix
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(ApiError::bad_request(
+            "snapshot prefix may only contain letters, numbers, dots, dashes, and underscores",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_cadence(cadence: &str) -> Result<(), ApiError> {
+    if !matches!(cadence, "hourly" | "daily" | "weekly" | "monthly") {
+        return Err(ApiError::bad_request(
+            "snapshot cadence must be hourly, daily, weekly, or monthly",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_relative_file_path(path: &str) -> Result<(), ApiError> {
     reject_shell_chars(path, "snapshot file")?;
     if path.starts_with('/')
@@ -443,9 +482,14 @@ fn validate_relative_file_path(path: &str) -> Result<(), ApiError> {
 }
 
 fn validate_snapshot_search(search: &str) -> Result<(), ApiError> {
-    if search.contains('\0') || search.contains('\n') || search.contains(';') || search.contains('|')
+    if search.contains('\0')
+        || search.contains('\n')
+        || search.contains(';')
+        || search.contains('|')
     {
-        return Err(ApiError::bad_request("snapshot search contains unsafe characters"));
+        return Err(ApiError::bad_request(
+            "snapshot search contains unsafe characters",
+        ));
     }
     Ok(())
 }
@@ -959,6 +1003,158 @@ async fn create_snapshot(
             )
             .await?,
     ))
+}
+
+#[derive(Debug, Serialize)]
+struct SnapshotTask {
+    id: String,
+    dataset: String,
+    prefix: String,
+    cadence: String,
+    retention_count: i64,
+    enabled: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+fn row_to_snapshot_task(row: sqlx::sqlite::SqliteRow) -> SnapshotTask {
+    SnapshotTask {
+        id: row.get("id"),
+        dataset: row.get("dataset"),
+        prefix: row.get("prefix"),
+        cadence: row.get("cadence"),
+        retention_count: row.get("retention_count"),
+        enabled: row.get::<i64, _>("enabled") == 1,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateSnapshotTaskRequest {
+    dataset: String,
+    prefix: String,
+    cadence: String,
+    retention_count: i64,
+    enabled: bool,
+}
+
+async fn list_snapshot_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SnapshotTask>>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    let rows = sqlx::query("select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at from snapshot_tasks order by dataset, prefix")
+        .fetch_all(&state.db)
+        .await?;
+    Ok(Json(rows.into_iter().map(row_to_snapshot_task).collect()))
+}
+
+async fn create_snapshot_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateSnapshotTaskRequest>,
+) -> Result<Json<SnapshotTask>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_dataset_name(&body.dataset)?;
+    validate_snapshot_prefix(&body.prefix)?;
+    validate_snapshot_cadence(&body.cadence)?;
+    if !(1..=10_000).contains(&body.retention_count) {
+        return Err(ApiError::bad_request(
+            "snapshot retention count must be between 1 and 10000",
+        ));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let task = SnapshotTask {
+        id: Uuid::new_v4().to_string(),
+        dataset: body.dataset,
+        prefix: body.prefix,
+        cadence: body.cadence,
+        retention_count: body.retention_count,
+        enabled: body.enabled,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    sqlx::query("insert into snapshot_tasks (id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(&task.id)
+        .bind(&task.dataset)
+        .bind(&task.prefix)
+        .bind(&task.cadence)
+        .bind(task.retention_count)
+        .bind(if task.enabled { 1 } else { 0 })
+        .bind(&task.created_at)
+        .bind(&task.updated_at)
+        .execute(&state.db)
+        .await?;
+    state
+        .audit(
+            &user.username,
+            "snapshot_task",
+            &task.dataset,
+            "ok",
+            "snapshot task created",
+        )
+        .await?;
+    Ok(Json(task))
+}
+
+async fn delete_snapshot_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    let result = sqlx::query("delete from snapshot_tasks where id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("snapshot task not found"));
+    }
+    state
+        .audit(
+            &user.username,
+            "snapshot_task",
+            &id,
+            "ok",
+            "snapshot task deleted",
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
+}
+
+async fn run_snapshot_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    let row = sqlx::query("select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at from snapshot_tasks where id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::not_found("snapshot task not found"))?;
+    let task = row_to_snapshot_task(row);
+    if !task.enabled {
+        return Err(ApiError::bad_request("snapshot task is disabled"));
+    }
+    let label = format!("{}-{}", task.prefix, Utc::now().format("%Y%m%d-%H%M%S"));
+    validate_snapshot_label(&label)?;
+    let data = state
+        .helper(
+            &user.username,
+            HelperOperation::CreateSnapshot {
+                dataset: task.dataset,
+                name: label,
+            },
+        )
+        .await?;
+    Ok(Json(data))
 }
 
 async fn delete_snapshot(
@@ -2098,6 +2294,77 @@ mod tests {
                     .uri(format!("/api/snapshots/{encoded}/rollback"))
                     .header("authorization", format!("Bearer {token}"))
                     .header("x-bnasmgr-confirm", snapshot)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_tasks_are_admin_managed_and_runnable() {
+        let (app, token) = login_admin(test_app().await).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/snapshots/tasks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"dataset":"tank/media","prefix":"auto","cadence":"daily","retention_count":14,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let task: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = task["id"].as_str().unwrap();
+        assert_eq!(task["dataset"], "tank/media");
+        assert_eq!(task["retention_count"], 14);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/snapshots/tasks/{id}/run"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/snapshots/tasks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let tasks: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/snapshots/tasks/{id}"))
+                    .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )

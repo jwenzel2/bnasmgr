@@ -17,6 +17,21 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - Destructive snapshot delete/rollback requires an exact `X-BNASMGR-CONFIRM` header.
 - FreeBSD deployment notes and manual smoke checklist.
 
+## Traditional NAS Feature Plan
+
+The next implementation track is modeled after common TrueNAS-style NAS administration:
+
+- Scheduled snapshot tasks with cadence and retention metadata.
+- Pool scrub management and status.
+- SMART disk health, SMART test launch, and disk inventory.
+- Alerts and notifications for degraded pools, failed helper operations, disk health, and service failures.
+- Replication tasks for local and remote ZFS send/receive.
+- Dataset CRUD, including compression, atime, quota, reservation, and mountpoint controls.
+- Snapshot clone/diff workflows to improve point-in-time recovery.
+- Full iSCSI target/extent/LUN CRUD.
+- Local Unix users/groups and directory service integration.
+- Config backup/restore, UPS integration, network configuration, and system reporting.
+
 ## Verification Commands
 
 Run these before handing off or cutting a release:
@@ -32,6 +47,7 @@ The latest local verification passed with these commands.
 
 ## Still Left
 
+- Execute scheduled snapshot tasks automatically from a durable scheduler and enforce retention by deleting old matching snapshots.
 - Run the FreeBSD manual acceptance checklist on an actual FreeBSD host with a disposable ZFS pool/dataset.
 - Wire and validate Samba include fragments on the exact Samba package version installed on the target host.
 - Wire and validate NFS export fragment consumption before relying on generated exports in production.

@@ -329,19 +329,23 @@ impl HelperClient for MockHelper {
                 .unwrap_or_else(|_| serde_json::json!([])),
             },
             HelperOperation::SearchSnapshotFiles { snapshot, search } => {
-                let files = ["Movies/example.mkv", "Photos/2026/image.jpg", "docs/report.txt"]
-                    .into_iter()
-                    .filter(|file| {
-                        search
-                            .as_ref()
-                            .map(|query| {
-                                file.to_ascii_lowercase()
-                                    .contains(&query.to_ascii_lowercase())
-                            })
-                            .unwrap_or(true)
-                    })
-                    .map(|path| serde_json::json!({ "path": path, "kind": "file" }))
-                    .collect::<Vec<_>>();
+                let files = [
+                    "Movies/example.mkv",
+                    "Photos/2026/image.jpg",
+                    "docs/report.txt",
+                ]
+                .into_iter()
+                .filter(|file| {
+                    search
+                        .as_ref()
+                        .map(|query| {
+                            file.to_ascii_lowercase()
+                                .contains(&query.to_ascii_lowercase())
+                        })
+                        .unwrap_or(true)
+                })
+                .map(|path| serde_json::json!({ "path": path, "kind": "file" }))
+                .collect::<Vec<_>>();
                 HelperResponse {
                     ok: true,
                     category: "snapshot_files".into(),
@@ -983,7 +987,9 @@ async fn freebsd_search_snapshot_files(
     operation: &HelperOperation,
 ) -> Result<HelperResponse, HelperError> {
     let HelperOperation::SearchSnapshotFiles { snapshot, search } = operation else {
-        return Err(HelperError::Rejected("expected snapshot file search".into()));
+        return Err(HelperError::Rejected(
+            "expected snapshot file search".into(),
+        ));
     };
     validate_snapshot_name(snapshot)?;
     if let Some(search) = search {
@@ -1032,7 +1038,9 @@ async fn freebsd_restore_snapshot_files(
     operation: &HelperOperation,
 ) -> Result<HelperResponse, HelperError> {
     let HelperOperation::RestoreSnapshotFiles { snapshot, files } = operation else {
-        return Err(HelperError::Rejected("expected snapshot file restore".into()));
+        return Err(HelperError::Rejected(
+            "expected snapshot file restore".into(),
+        ));
     };
     validate_snapshot_name(snapshot)?;
     if files.is_empty() {
@@ -1227,7 +1235,10 @@ fn relative_snapshot_file(root: &Path, value: &str) -> Result<String, HelperErro
     let relative = Path::new(value)
         .strip_prefix(root)
         .map_err(|_| HelperError::Rejected("snapshot file outside root".into()))?;
-    let text = relative.to_string_lossy().trim_start_matches('/').to_string();
+    let text = relative
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .to_string();
     validate_relative_file(&text)?;
     Ok(text)
 }
@@ -1684,14 +1695,8 @@ mod tests {
 
     #[test]
     fn renders_samba_server_settings_fragment() {
-        let settings = render_samba_server_settings(
-            "HOME",
-            "Home NAS",
-            "BNAS",
-            "user",
-            "Bad User",
-            "2",
-        );
+        let settings =
+            render_samba_server_settings("HOME", "Home NAS", "BNAS", "user", "Bad User", "2");
         assert!(settings.contains("[global]"));
         assert!(settings.contains("workgroup = HOME"));
         assert!(settings.contains("netbios name = BNAS"));

@@ -8,6 +8,7 @@
   let passwordForm = { current_password: 'admin', new_password: '' };
   let storage = { pools: [], datasets: [] };
   let snapshots = [];
+  let snapshotTasks = [];
   let services = [];
   let sambaShares = [];
   let sambaSettings = { workgroup: 'WORKGROUP', server_string: 'bnasmgr NAS', netbios_name: 'BNASMGR', security: 'user', map_to_guest: 'Bad User', log_level: '1' };
@@ -18,6 +19,7 @@
   let helperHistory = [];
   let users = [];
   let snapshotForm = { dataset: 'tank/media', name: '' };
+  let snapshotTaskForm = { dataset: 'tank/media', prefix: 'auto', cadence: 'daily', retention_count: 14, enabled: true };
   let snapshotFileSnapshot = '';
   let snapshotFileSearch = '';
   let snapshotFiles = [];
@@ -58,7 +60,7 @@
 
   async function loadAll() {
     if (!token || user?.must_change_password) return;
-    await Promise.all([loadStorage(), loadSnapshots(), loadServices(), loadShares(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
+    await Promise.all([loadStorage(), loadSnapshots(), loadSnapshotTasks(), loadServices(), loadShares(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
   }
 
   async function restoreSession() {
@@ -97,6 +99,33 @@
   async function createSnapshot() {
     await request('/api/snapshots', { method: 'POST', body: JSON.stringify(snapshotForm) });
     snapshotForm.name = '';
+    await loadSnapshots();
+  }
+
+  async function loadSnapshotTasks() {
+    snapshotTasks = await request('/api/snapshots/tasks');
+  }
+
+  async function createSnapshotTask() {
+    await request('/api/snapshots/tasks', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...snapshotTaskForm,
+        retention_count: Number(snapshotTaskForm.retention_count)
+      })
+    });
+    snapshotTaskForm = { ...snapshotTaskForm, prefix: 'auto' };
+    await loadSnapshotTasks();
+  }
+
+  async function deleteSnapshotTask(id, prefix) {
+    if (!confirm(`Delete snapshot task ${prefix}?`)) return;
+    await request(`/api/snapshots/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await loadSnapshotTasks();
+  }
+
+  async function runSnapshotTask(id) {
+    await request(`/api/snapshots/tasks/${encodeURIComponent(id)}/run`, { method: 'POST' });
     await loadSnapshots();
   }
 
@@ -367,6 +396,36 @@
             <button>Create</button>
           </form>
           <table><tbody>{#each snapshots as snap}<tr><td>{snap.name}</td><td>{snap.used}</td><td><button on:click={() => rollbackSnapshot(snap.name)}>Rollback</button><button on:click={() => deleteSnapshot(snap.name)}>Delete</button></td></tr>{/each}</tbody></table>
+          <div class="subpanel">
+            <h2>Snapshot tasks</h2>
+            <form class="inline" on:submit|preventDefault={createSnapshotTask}>
+              <input bind:value={snapshotTaskForm.dataset} placeholder="dataset" />
+              <input bind:value={snapshotTaskForm.prefix} placeholder="prefix" />
+              <select bind:value={snapshotTaskForm.cadence}>
+                <option value="hourly">hourly</option>
+                <option value="daily">daily</option>
+                <option value="weekly">weekly</option>
+                <option value="monthly">monthly</option>
+              </select>
+              <input bind:value={snapshotTaskForm.retention_count} type="number" min="1" max="10000" placeholder="keep" />
+              <label class="check"><input type="checkbox" bind:checked={snapshotTaskForm.enabled} /> Enabled</label>
+              <button>Save task</button>
+            </form>
+            <table>
+              <tbody>
+                {#each snapshotTasks as task}
+                  <tr>
+                    <td>{task.dataset}</td>
+                    <td>{task.prefix}</td>
+                    <td>{task.cadence}</td>
+                    <td>keep {task.retention_count}</td>
+                    <td>{task.enabled ? 'enabled' : 'disabled'}</td>
+                    <td><button disabled={!task.enabled} on:click={() => runSnapshotTask(task.id)}>Run now</button><button on:click={() => deleteSnapshotTask(task.id, task.prefix)}>Delete</button></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
           <form class="inline restore-search" on:submit|preventDefault={() => snapshotFileSnapshot && searchSnapshotFiles(snapshotFileSnapshot)}>
             <input bind:value={snapshotFileSearch} placeholder="file search in selected snapshot" />
             <select bind:value={snapshotFileSnapshot} on:change={(event) => event.currentTarget.value && searchSnapshotFiles(event.currentTarget.value)}>
