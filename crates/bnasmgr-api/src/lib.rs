@@ -186,8 +186,17 @@ pub fn app(state: AppState) -> Router {
         .route("/api/storage/overview", get(storage_overview))
         .route("/api/storage/quota", post(set_quota))
         .route("/api/snapshots", get(list_snapshots).post(create_snapshot))
+        .route("/api/snapshots/:snapshot/files", get(search_snapshot_files))
+        .route(
+            "/api/snapshots/:snapshot/files/restore",
+            post(restore_snapshot_files),
+        )
         .route("/api/snapshots/:snapshot", delete(delete_snapshot))
         .route("/api/snapshots/:snapshot/rollback", post(rollback_snapshot))
+        .route(
+            "/api/shares/samba/settings",
+            get(get_samba_settings).post(save_samba_settings),
+        )
         .route("/api/shares/samba", get(list_samba).post(upsert_samba))
         .route(
             "/api/shares/samba/users",
@@ -415,6 +424,28 @@ fn validate_snapshot_label(name: &str) -> Result<(), ApiError> {
     reject_shell_chars(name, "snapshot name")?;
     if name.contains('/') || name.contains('@') || name.contains("..") {
         return Err(ApiError::bad_request("snapshot name is not valid"));
+    }
+    Ok(())
+}
+
+fn validate_relative_file_path(path: &str) -> Result<(), ApiError> {
+    reject_shell_chars(path, "snapshot file")?;
+    if path.starts_with('/')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ApiError::bad_request(
+            "snapshot file path must be relative and must not contain traversal",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_search(search: &str) -> Result<(), ApiError> {
+    if search.contains('\0') || search.contains('\n') || search.contains(';') || search.contains('|')
+    {
+        return Err(ApiError::bad_request("snapshot search contains unsafe characters"));
     }
     Ok(())
 }
@@ -965,6 +996,202 @@ async fn rollback_snapshot(
     ))
 }
 
+#[derive(Deserialize)]
+struct SnapshotFileQuery {
+    search: Option<String>,
+}
+
+async fn search_snapshot_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(snapshot): Path<String>,
+    Query(query): Query<SnapshotFileQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    validate_snapshot_name(&snapshot)?;
+    if let Some(search) = &query.search {
+        validate_snapshot_search(search)?;
+    }
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::SearchSnapshotFiles {
+                    snapshot,
+                    search: query.search,
+                },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RestoreSnapshotFilesRequest {
+    files: Vec<String>,
+}
+
+async fn restore_snapshot_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(snapshot): Path<String>,
+    Json(body): Json<RestoreSnapshotFilesRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_snapshot_name(&snapshot)?;
+    require_snapshot_confirmation(&headers, &snapshot)?;
+    if body.files.is_empty() || body.files.len() > 100 {
+        return Err(ApiError::bad_request(
+            "select between 1 and 100 snapshot files to restore",
+        ));
+    }
+    for file in &body.files {
+        validate_relative_file_path(file)?;
+    }
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::RestoreSnapshotFiles {
+                    snapshot,
+                    files: body.files,
+                },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SambaServerSettings {
+    workgroup: String,
+    server_string: String,
+    netbios_name: String,
+    security: String,
+    map_to_guest: String,
+    log_level: String,
+}
+
+impl Default for SambaServerSettings {
+    fn default() -> Self {
+        Self {
+            workgroup: "WORKGROUP".into(),
+            server_string: "bnasmgr NAS".into(),
+            netbios_name: "BNASMGR".into(),
+            security: "user".into(),
+            map_to_guest: "Bad User".into(),
+            log_level: "1".into(),
+        }
+    }
+}
+
+fn validate_samba_setting_value(field: &str, value: &str) -> Result<(), ApiError> {
+    reject_shell_chars(value, field)?;
+    if value.len() > 80 {
+        return Err(ApiError::bad_request(format!("{field} is too long")));
+    }
+    Ok(())
+}
+
+fn validate_samba_settings(settings: &SambaServerSettings) -> Result<(), ApiError> {
+    validate_samba_setting_value("workgroup", &settings.workgroup)?;
+    validate_samba_setting_value("server string", &settings.server_string)?;
+    validate_samba_setting_value("netbios name", &settings.netbios_name)?;
+    validate_samba_setting_value("security", &settings.security)?;
+    validate_samba_setting_value("map to guest", &settings.map_to_guest)?;
+    validate_samba_setting_value("log level", &settings.log_level)?;
+    if !settings
+        .workgroup
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err(ApiError::bad_request(
+            "workgroup may only contain letters, numbers, dashes, and underscores",
+        ));
+    }
+    if !settings
+        .netbios_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err(ApiError::bad_request(
+            "netbios name may only contain letters, numbers, dashes, and underscores",
+        ));
+    }
+    if !matches!(settings.security.as_str(), "user" | "ads" | "domain") {
+        return Err(ApiError::bad_request("unsupported Samba security mode"));
+    }
+    if !matches!(
+        settings.map_to_guest.as_str(),
+        "Never" | "Bad User" | "Bad Password"
+    ) {
+        return Err(ApiError::bad_request("unsupported Samba map to guest mode"));
+    }
+    if !settings.log_level.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(ApiError::bad_request("log level must be numeric"));
+    }
+    Ok(())
+}
+
+async fn load_samba_settings(state: &AppState) -> Result<SambaServerSettings, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("select value from app_settings where key = 'samba_server_settings'")
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+async fn get_samba_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SambaServerSettings>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(load_samba_settings(&state).await?))
+}
+
+async fn save_samba_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SambaServerSettings>,
+) -> Result<Json<SambaServerSettings>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_samba_settings(&body)?;
+    state
+        .helper(
+            &user.username,
+            HelperOperation::ApplySambaServerSettings {
+                workgroup: body.workgroup.clone(),
+                server_string: body.server_string.clone(),
+                netbios_name: body.netbios_name.clone(),
+                security: body.security.clone(),
+                map_to_guest: body.map_to_guest.clone(),
+                log_level: body.log_level.clone(),
+            },
+        )
+        .await?;
+    sqlx::query(
+        "insert into app_settings (key, value) values ('samba_server_settings', ?)
+         on conflict(key) do update set value = excluded.value",
+    )
+    .bind(serde_json::to_string(&body).map_err(|err| ApiError::internal(err.to_string()))?)
+    .execute(&state.db)
+    .await?;
+    state
+        .audit(
+            &user.username,
+            "samba_settings",
+            &body.workgroup,
+            "ok",
+            "samba server settings saved",
+        )
+        .await?;
+    Ok(Json(body))
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct SambaShare {
     id: Option<String>,
@@ -1268,6 +1495,8 @@ async fn list_services(
         ("zfs", "ZFS"),
         ("samba_server", "Samba"),
         ("nfsd", "NFS"),
+        ("mountd", "NFS Mount Daemon"),
+        ("rpcbind", "RPC Bind"),
         ("ctld", "iSCSI Target"),
         ("syslogd", "System Logs"),
     ] {
@@ -1377,7 +1606,7 @@ async fn helper_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
@@ -1500,6 +1729,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn samba_server_settings_are_admin_managed() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/shares/samba/settings")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workgroup":"HOME","server_string":"Home NAS","netbios_name":"BNAS","security":"user","map_to_guest":"Bad User","log_level":"2"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/shares/samba/settings")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settings["workgroup"], "HOME");
+        assert_eq!(settings["netbios_name"], "BNAS");
     }
 
     #[tokio::test]
@@ -1654,6 +1921,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_list_covers_nas_service_allowlist() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/services")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let services: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = services
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|service| service["name"].as_str())
+            .collect();
+        for service in [
+            "zfs",
+            "samba_server",
+            "nfsd",
+            "mountd",
+            "rpcbind",
+            "ctld",
+            "syslogd",
+        ] {
+            assert!(names.contains(&service), "missing service {service}");
+        }
+    }
+
+    #[tokio::test]
     async fn quota_values_are_validated_by_api() {
         let (app, token) = login_admin(test_app().await).await;
         let response = app
@@ -1797,6 +2099,73 @@ mod tests {
                     .header("authorization", format!("Bearer {token}"))
                     .header("x-bnasmgr-confirm", snapshot)
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_restore_requires_exact_confirmation_and_relative_paths() {
+        let (app, token) = login_admin(test_app().await).await;
+        let snapshot = "tank/media@daily-2026-05-18";
+        let encoded = "tank%2Fmedia%40daily-2026-05-18";
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/snapshots/{encoded}/files?search=report"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/snapshots/{encoded}/files/restore"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"files":["docs/report.txt"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/snapshots/{encoded}/files/restore"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("x-bnasmgr-confirm", snapshot)
+                    .body(Body::from(r#"{"files":["../bad"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/snapshots/{encoded}/files/restore"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("x-bnasmgr-confirm", snapshot)
+                    .body(Body::from(r#"{"files":["docs/report.txt"]}"#))
                     .unwrap(),
             )
             .await

@@ -171,10 +171,11 @@ Storage and snapshot reads are parsed from `zpool list -Hp`, `zfs list -Hp`, and
 
 Log reads tail known log files and support service, severity, search text, and date-range filters. FreeBSD syslog-style timestamps do not carry a year, so they are interpreted with the current year.
 
-Samba and NFS share metadata is persisted by the API and applied through typed helper operations. The FreeBSD command backend validates the requested share/export data, writes helper-owned fragments, and reloads the relevant service (`samba_server` or `mountd`).
+Samba server settings and Samba/NFS share metadata are persisted by the API and applied through typed helper operations. The FreeBSD command backend validates the requested settings/share/export data, writes helper-owned fragments, and reloads the relevant service (`samba_server` or `mountd`).
 
 Share application now uses helper-owned fragments:
 
+- Samba global settings default to `/usr/local/etc/bnasmgr/smb4.includes/00-global.conf`.
 - Samba fragments default to `/usr/local/etc/bnasmgr/smb4.includes/*.conf`.
 - NFS export fragments default to `/usr/local/etc/bnasmgr/exports.d/*.exports`.
 - Override these with `BNASMGR_SAMBA_INCLUDE_DIR` and `BNASMGR_NFS_EXPORTS_DIR` in the helper environment.
@@ -186,6 +187,8 @@ Wire Samba by including the generated fragment set from `smb4.conf` according to
 Snapshot delete and rollback are destructive. The UI requires confirmation and the backend requires a changed admin password before those actions are accepted.
 
 Snapshot delete and rollback also require `X-BNASMGR-CONFIRM` to exactly match the target snapshot name. This protects the API if a request bypasses the browser confirmation dialog.
+
+File-level snapshot restore uses the dataset snapshot mount at `<mountpoint>/.zfs/snapshot/<snapshot-name>` and copies selected relative file paths back into the live dataset. It does not roll back the entire dataset. Restore requests still require `X-BNASMGR-CONFIRM` because existing live files can be overwritten.
 
 Dashboard users are separate from FreeBSD users and Samba users. Use dashboard users only for web access; use Samba/system tooling for storage identities until deeper identity reconciliation is implemented.
 

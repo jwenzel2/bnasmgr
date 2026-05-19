@@ -8,9 +8,11 @@ Automated coverage in this MVP includes:
 - Service allowlist enforcement and quota value validation.
 - Helper operation history API and audit UI.
 - Samba storage user create/update/delete, password stdin handling, and helper-history redaction.
+- Samba server settings persistence and helper-applied global fragment rendering.
 - Samba/NFS share fragment rendering and safe fragment file-name generation.
 - Log service/severity/search/date-range filtering and FreeBSD syslog timestamp parsing.
 - Snapshot dataset/name validation and backend confirmation header enforcement for delete/rollback.
+- Snapshot file search and selected-file restore validation.
 - Argon2id password hashing with legacy development-hash verification.
 - Dashboard user create, role change, password reset, delete, self-delete guard, and last-admin guard.
 - Service status color mapping.
@@ -26,3 +28,5 @@ Manual smoke coverage:
 6. Create a snapshot in mock mode and confirm audit entries are written.
 7. Trigger service `start`, `stop`, and `restart` in mock mode.
 8. On FreeBSD, validate real helper command execution against a disposable ZFS dataset before using production pools.
+
+See `docs/remaining-work.md` for the current handoff checklist and post-MVP work.

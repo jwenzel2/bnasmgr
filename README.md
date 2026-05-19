@@ -52,7 +52,8 @@ All routes are under `/api`:
 - `/api/users` for listing, creating, deleting, role changes, and password resets
 - `/api/storage/*`
 - `/api/snapshots/*`
-- `/api/shares/samba/*`
+- `/api/snapshots/:snapshot/files` for searching snapshot contents and restoring selected files
+- `/api/shares/samba/*` including server settings, shares, and Samba users
 - `/api/shares/nfs/*`
 - `/api/services/*`
 - `/api/logs`
@@ -66,11 +67,15 @@ Service control is restricted to the NAS service allowlist, and quota updates ar
 
 Samba storage users are managed separately from dashboard users. Samba passwords are sent to the helper over the local socket and are redacted from helper history.
 
+Dashboard admins can manage common Samba server settings such as workgroup, server string, NetBIOS name, security mode, guest mapping, and log level. The helper writes these as a Samba global fragment before reloading `samba_server`.
+
 Samba and NFS share application writes helper-owned config fragments atomically before service reload. The default FreeBSD fragment roots are `/usr/local/etc/bnasmgr/smb4.includes` and `/usr/local/etc/bnasmgr/exports.d`.
 
 The log viewer supports service, severity, search text, and date-range filters. FreeBSD syslog-style timestamps are parsed using the current year.
 
 Destructive snapshot delete and rollback calls require an `X-BNASMGR-CONFIRM` header matching the exact snapshot name, in addition to UI confirmation.
+
+File-level snapshot restore searches files under the dataset snapshot mount and restores selected relative paths back into the live dataset. Restore requests also require `X-BNASMGR-CONFIRM` matching the snapshot name because existing live files may be overwritten.
 
 ## Project Layout
 

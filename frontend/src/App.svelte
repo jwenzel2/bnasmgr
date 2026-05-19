@@ -10,6 +10,7 @@
   let snapshots = [];
   let services = [];
   let sambaShares = [];
+  let sambaSettings = { workgroup: 'WORKGROUP', server_string: 'bnasmgr NAS', netbios_name: 'BNASMGR', security: 'user', map_to_guest: 'Bad User', log_level: '1' };
   let sambaUsers = [];
   let nfsShares = [];
   let logs = [];
@@ -17,6 +18,10 @@
   let helperHistory = [];
   let users = [];
   let snapshotForm = { dataset: 'tank/media', name: '' };
+  let snapshotFileSnapshot = '';
+  let snapshotFileSearch = '';
+  let snapshotFiles = [];
+  let selectedSnapshotFiles = {};
   let sambaForm = { name: '', path: '', allowed_users: '', readonly: false };
   let sambaUserForm = { username: '', password: '', enabled: true };
   let nfsForm = { path: '', clients: '', options: '-maproot=root' };
@@ -84,6 +89,9 @@
 
   async function loadSnapshots() {
     snapshots = await request(`/api/snapshots?dataset=${encodeURIComponent(snapshotForm.dataset)}`);
+    snapshotFileSnapshot = snapshots[0]?.name || '';
+    snapshotFiles = [];
+    selectedSnapshotFiles = {};
   }
 
   async function createSnapshot() {
@@ -109,6 +117,29 @@
     });
   }
 
+  async function searchSnapshotFiles(name) {
+    const params = new URLSearchParams();
+    if (snapshotFileSearch.trim()) params.set('search', snapshotFileSearch.trim());
+    snapshotFiles = await request(`/api/snapshots/${encodeURIComponent(name)}/files?${params}`);
+    selectedSnapshotFiles = {};
+  }
+
+  function toggleSnapshotFile(path) {
+    selectedSnapshotFiles = { ...selectedSnapshotFiles, [path]: !selectedSnapshotFiles[path] };
+  }
+
+  async function restoreSnapshotFiles(name) {
+    const files = Object.entries(selectedSnapshotFiles).filter(([, selected]) => selected).map(([path]) => path);
+    if (!files.length) return;
+    if (!confirm(`Restore ${files.length} file(s) from ${name}? Existing files will be overwritten.`)) return;
+    await request(`/api/snapshots/${encodeURIComponent(name)}/files/restore`, {
+      method: 'POST',
+      headers: { 'x-bnasmgr-confirm': name },
+      body: JSON.stringify({ files })
+    });
+    selectedSnapshotFiles = {};
+  }
+
   async function loadServices() {
     services = await request('/api/services');
   }
@@ -119,7 +150,15 @@
   }
 
   async function loadShares() {
-    [sambaShares, sambaUsers, nfsShares] = await Promise.all([request('/api/shares/samba'), request('/api/shares/samba/users'), request('/api/shares/nfs')]);
+    [sambaShares, sambaSettings, sambaUsers, nfsShares] = await Promise.all([request('/api/shares/samba'), request('/api/shares/samba/settings'), request('/api/shares/samba/users'), request('/api/shares/nfs')]);
+  }
+
+  async function saveSambaSettings() {
+    sambaSettings = await request('/api/shares/samba/settings', {
+      method: 'POST',
+      body: JSON.stringify(sambaSettings)
+    });
+    await loadShares();
   }
 
   async function saveSamba() {
@@ -328,11 +367,46 @@
             <button>Create</button>
           </form>
           <table><tbody>{#each snapshots as snap}<tr><td>{snap.name}</td><td>{snap.used}</td><td><button on:click={() => rollbackSnapshot(snap.name)}>Rollback</button><button on:click={() => deleteSnapshot(snap.name)}>Delete</button></td></tr>{/each}</tbody></table>
+          <form class="inline restore-search" on:submit|preventDefault={() => snapshotFileSnapshot && searchSnapshotFiles(snapshotFileSnapshot)}>
+            <input bind:value={snapshotFileSearch} placeholder="file search in selected snapshot" />
+            <select bind:value={snapshotFileSnapshot} on:change={(event) => event.currentTarget.value && searchSnapshotFiles(event.currentTarget.value)}>
+              <option value="">Select snapshot</option>
+              {#each snapshots as snap}<option value={snap.name}>{snap.name}</option>{/each}
+            </select>
+            <button disabled={!snapshotFileSnapshot}>Search files</button>
+          </form>
+          {#if snapshotFiles.length}
+            <div class="restore-list">
+              {#each snapshotFiles as file}
+                <label class="check"><input type="checkbox" checked={!!selectedSnapshotFiles[file.path]} on:change={() => toggleSnapshotFile(file.path)} /> {file.path}</label>
+              {/each}
+            </div>
+            <div class="actions">
+              <button on:click={() => snapshotFileSnapshot && restoreSnapshotFiles(snapshotFileSnapshot)}>Restore selected</button>
+            </div>
+          {/if}
         </section>
       {:else if active === 'shares'}
         <section class="split">
           <div class="panel">
             <h2>Samba</h2>
+            <form class="stack" on:submit|preventDefault={saveSambaSettings}>
+              <input bind:value={sambaSettings.workgroup} placeholder="workgroup" />
+              <input bind:value={sambaSettings.server_string} placeholder="server string" />
+              <input bind:value={sambaSettings.netbios_name} placeholder="netbios name" />
+              <select bind:value={sambaSettings.security}>
+                <option value="user">user</option>
+                <option value="ads">ads</option>
+                <option value="domain">domain</option>
+              </select>
+              <select bind:value={sambaSettings.map_to_guest}>
+                <option value="Bad User">Bad User</option>
+                <option value="Bad Password">Bad Password</option>
+                <option value="Never">Never</option>
+              </select>
+              <input bind:value={sambaSettings.log_level} placeholder="log level" />
+              <button>Save server settings</button>
+            </form>
             <form class="stack" on:submit|preventDefault={saveSamba}>
               <input bind:value={sambaForm.name} placeholder="share name" />
               <input bind:value={sambaForm.path} placeholder="/mnt/tank/share" />

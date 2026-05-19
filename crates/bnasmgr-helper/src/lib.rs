@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -34,6 +37,14 @@ pub enum HelperOperation {
     SetQuota {
         dataset: String,
         quota: String,
+    },
+    ApplySambaServerSettings {
+        workgroup: String,
+        server_string: String,
+        netbios_name: String,
+        security: String,
+        map_to_guest: String,
+        log_level: String,
     },
     ApplySambaShare {
         name: String,
@@ -73,6 +84,14 @@ pub enum HelperOperation {
         search: Option<String>,
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
+    },
+    SearchSnapshotFiles {
+        snapshot: String,
+        search: Option<String>,
+    },
+    RestoreSnapshotFiles {
+        snapshot: String,
+        files: Vec<String>,
     },
 }
 
@@ -200,6 +219,13 @@ impl HelperClient for MockHelper {
                 message: format!("quota set to {quota}"),
                 data: serde_json::json!({}),
             },
+            HelperOperation::ApplySambaServerSettings { workgroup, .. } => HelperResponse {
+                ok: true,
+                category: "samba_settings".into(),
+                target: workgroup,
+                message: "samba server settings applied".into(),
+                data: serde_json::json!({}),
+            },
             HelperOperation::ApplySambaShare { name, .. } => HelperResponse {
                 ok: true,
                 category: "samba".into(),
@@ -253,7 +279,10 @@ impl HelperClient for MockHelper {
                 status.insert("zfs".to_string(), "running".to_string());
                 status.insert("samba_server".to_string(), "running".to_string());
                 status.insert("nfsd".to_string(), "stopped".to_string());
+                status.insert("mountd".to_string(), "stopped".to_string());
+                status.insert("rpcbind".to_string(), "stopped".to_string());
                 status.insert("ctld".to_string(), "unknown".to_string());
+                status.insert("syslogd".to_string(), "running".to_string());
                 let value = status
                     .get(&service)
                     .cloned()
@@ -298,6 +327,35 @@ impl HelperClient for MockHelper {
                     to,
                 ))
                 .unwrap_or_else(|_| serde_json::json!([])),
+            },
+            HelperOperation::SearchSnapshotFiles { snapshot, search } => {
+                let files = ["Movies/example.mkv", "Photos/2026/image.jpg", "docs/report.txt"]
+                    .into_iter()
+                    .filter(|file| {
+                        search
+                            .as_ref()
+                            .map(|query| {
+                                file.to_ascii_lowercase()
+                                    .contains(&query.to_ascii_lowercase())
+                            })
+                            .unwrap_or(true)
+                    })
+                    .map(|path| serde_json::json!({ "path": path, "kind": "file" }))
+                    .collect::<Vec<_>>();
+                HelperResponse {
+                    ok: true,
+                    category: "snapshot_files".into(),
+                    target: snapshot,
+                    message: "mock snapshot files loaded".into(),
+                    data: serde_json::json!(files),
+                }
+            }
+            HelperOperation::RestoreSnapshotFiles { snapshot, files } => HelperResponse {
+                ok: true,
+                category: "snapshot_restore".into(),
+                target: snapshot,
+                message: format!("{} file(s) restored from snapshot", files.len()),
+                data: serde_json::json!({ "restored": files }),
             },
         };
         Ok(response)
@@ -438,6 +496,26 @@ impl FreeBsdCommandBuilder {
                     dataset.clone(),
                 ]
             }
+            HelperOperation::ApplySambaServerSettings {
+                workgroup,
+                server_string,
+                netbios_name,
+                security,
+                map_to_guest,
+                log_level,
+            } => {
+                for value in [
+                    workgroup,
+                    server_string,
+                    netbios_name,
+                    security,
+                    map_to_guest,
+                    log_level,
+                ] {
+                    safe_arg(value)?;
+                }
+                vec!["service".into(), "samba_server".into(), "reload".into()]
+            }
             HelperOperation::ApplySambaShare {
                 name,
                 path,
@@ -519,6 +597,20 @@ impl FreeBsdCommandBuilder {
                     ]
                 }
             }
+            HelperOperation::SearchSnapshotFiles { snapshot, search } => {
+                safe_arg(snapshot)?;
+                if let Some(search) = search {
+                    safe_arg(search)?;
+                }
+                vec!["find".into(), snapshot.clone(), "-type".into(), "f".into()]
+            }
+            HelperOperation::RestoreSnapshotFiles { snapshot, files } => {
+                safe_arg(snapshot)?;
+                for file in files {
+                    safe_arg(file)?;
+                }
+                vec!["cp".into(), "-p".into()]
+            }
         };
         Ok(cmd)
     }
@@ -563,12 +655,19 @@ impl HelperClient for FreeBsdHelper {
             HelperOperation::ReadLogs { .. } => return freebsd_logs(&operation).await,
             HelperOperation::ApplySambaShare { .. }
             | HelperOperation::DeleteSambaShare { .. }
+            | HelperOperation::ApplySambaServerSettings { .. }
             | HelperOperation::ApplyNfsExport { .. }
             | HelperOperation::DeleteNfsExport { .. } => {
                 return freebsd_apply_share_fragment(&operation).await
             }
             HelperOperation::UpsertSambaUser { .. } => {
                 return freebsd_upsert_samba_user(&operation).await
+            }
+            HelperOperation::SearchSnapshotFiles { .. } => {
+                return freebsd_search_snapshot_files(&operation).await
+            }
+            HelperOperation::RestoreSnapshotFiles { .. } => {
+                return freebsd_restore_snapshot_files(&operation).await
             }
             _ => {}
         }
@@ -794,6 +893,32 @@ async fn freebsd_apply_share_fragment(
 ) -> Result<HelperResponse, HelperError> {
     let (category, target) = operation_category_target(operation);
     match operation {
+        HelperOperation::ApplySambaServerSettings {
+            workgroup,
+            server_string,
+            netbios_name,
+            security,
+            map_to_guest,
+            log_level,
+        } => {
+            let dir = config_dir(
+                "BNASMGR_SAMBA_INCLUDE_DIR",
+                "/usr/local/etc/bnasmgr/smb4.includes",
+            );
+            let file = dir.join("00-global.conf");
+            atomic_write(
+                &file,
+                &render_samba_server_settings(
+                    workgroup,
+                    server_string,
+                    netbios_name,
+                    security,
+                    map_to_guest,
+                    log_level,
+                ),
+            )
+            .await?;
+        }
         HelperOperation::ApplySambaShare {
             name,
             path,
@@ -854,6 +979,112 @@ async fn freebsd_apply_share_fragment(
     })
 }
 
+async fn freebsd_search_snapshot_files(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::SearchSnapshotFiles { snapshot, search } = operation else {
+        return Err(HelperError::Rejected("expected snapshot file search".into()));
+    };
+    validate_snapshot_name(snapshot)?;
+    if let Some(search) = search {
+        validate_search_text(search)?;
+    }
+    let root = snapshot_root(snapshot).await?;
+    let output = run_command(vec![
+        "find".into(),
+        root.to_string_lossy().to_string(),
+        "-type".into(),
+        "f".into(),
+    ])
+    .await?;
+    let query = search.as_ref().map(|value| value.to_ascii_lowercase());
+    let files = if output.ok {
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| relative_snapshot_file(&root, line).ok())
+            .filter(|path| {
+                query
+                    .as_ref()
+                    .map(|query| path.to_ascii_lowercase().contains(query))
+                    .unwrap_or(true)
+            })
+            .map(|path| serde_json::json!({ "path": path, "kind": "file" }))
+            .take(500)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "snapshot_files".into(),
+        target: snapshot.clone(),
+        message: if output.ok {
+            "snapshot files loaded".into()
+        } else {
+            output.stderr
+        },
+        data: serde_json::json!(files),
+    })
+}
+
+async fn freebsd_restore_snapshot_files(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::RestoreSnapshotFiles { snapshot, files } = operation else {
+        return Err(HelperError::Rejected("expected snapshot file restore".into()));
+    };
+    validate_snapshot_name(snapshot)?;
+    if files.is_empty() {
+        return Err(HelperError::Rejected("no files selected".into()));
+    }
+    if files.len() > 100 {
+        return Err(HelperError::Rejected(
+            "cannot restore more than 100 files at once".into(),
+        ));
+    }
+    for file in files {
+        validate_relative_file(file)?;
+    }
+    let dataset = snapshot_dataset(snapshot)?;
+    let live_root = dataset_mountpoint(&dataset).await?;
+    let snap_root = snapshot_root(snapshot).await?;
+    let mut restored = Vec::new();
+    for file in files {
+        let source = snap_root.join(file);
+        let destination = live_root.join(file);
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| HelperError::Other(err.into()))?;
+        }
+        let output = run_command(vec![
+            "cp".into(),
+            "-p".into(),
+            source.to_string_lossy().to_string(),
+            destination.to_string_lossy().to_string(),
+        ])
+        .await?;
+        if !output.ok {
+            return Ok(HelperResponse {
+                ok: false,
+                category: "snapshot_restore".into(),
+                target: snapshot.clone(),
+                message: output.stderr,
+                data: serde_json::json!({ "restored": restored }),
+            });
+        }
+        restored.push(file.clone());
+    }
+    Ok(HelperResponse {
+        ok: true,
+        category: "snapshot_restore".into(),
+        target: snapshot.clone(),
+        message: format!("{} file(s) restored from snapshot", restored.len()),
+        data: serde_json::json!({ "restored": restored }),
+    })
+}
+
 fn config_dir(env_key: &str, default: &str) -> PathBuf {
     std::env::var(env_key)
         .map(PathBuf::from)
@@ -904,6 +1135,103 @@ fn safe_file_stem(value: &str) -> Result<String, HelperError> {
     Ok(stem)
 }
 
+fn validate_snapshot_name(snapshot: &str) -> Result<(), HelperError> {
+    if snapshot.is_empty()
+        || snapshot.contains('\0')
+        || snapshot.contains('\n')
+        || snapshot.contains("..")
+        || !snapshot.contains('@')
+    {
+        return Err(HelperError::Rejected("invalid snapshot name".into()));
+    }
+    let (_, label) = snapshot
+        .split_once('@')
+        .ok_or_else(|| HelperError::Rejected("invalid snapshot name".into()))?;
+    if label.is_empty() || label.contains('/') {
+        return Err(HelperError::Rejected("invalid snapshot name".into()));
+    }
+    Ok(())
+}
+
+fn snapshot_dataset(snapshot: &str) -> Result<String, HelperError> {
+    validate_snapshot_name(snapshot)?;
+    snapshot
+        .split_once('@')
+        .map(|(dataset, _)| dataset.to_string())
+        .ok_or_else(|| HelperError::Rejected("invalid snapshot name".into()))
+}
+
+fn snapshot_label(snapshot: &str) -> Result<String, HelperError> {
+    validate_snapshot_name(snapshot)?;
+    snapshot
+        .split_once('@')
+        .map(|(_, label)| label.to_string())
+        .ok_or_else(|| HelperError::Rejected("invalid snapshot name".into()))
+}
+
+async fn dataset_mountpoint(dataset: &str) -> Result<PathBuf, HelperError> {
+    let output = run_command(vec![
+        "zfs".into(),
+        "get".into(),
+        "-Hp".into(),
+        "-o".into(),
+        "value".into(),
+        "mountpoint".into(),
+        dataset.into(),
+    ])
+    .await?;
+    if !output.ok {
+        return Err(HelperError::Rejected(output.stderr));
+    }
+    let mountpoint = output.stdout.lines().next().unwrap_or("").trim();
+    if mountpoint.is_empty() || matches!(mountpoint, "-" | "none" | "legacy") {
+        return Err(HelperError::Rejected(
+            "snapshot dataset has no mounted filesystem".into(),
+        ));
+    }
+    Ok(PathBuf::from(mountpoint))
+}
+
+async fn snapshot_root(snapshot: &str) -> Result<PathBuf, HelperError> {
+    let dataset = snapshot_dataset(snapshot)?;
+    let label = snapshot_label(snapshot)?;
+    Ok(dataset_mountpoint(&dataset)
+        .await?
+        .join(".zfs")
+        .join("snapshot")
+        .join(label))
+}
+
+fn validate_search_text(value: &str) -> Result<(), HelperError> {
+    if value.contains('\0') || value.contains('\n') || value.contains(';') || value.contains('|') {
+        return Err(HelperError::Rejected("unsafe search text".into()));
+    }
+    Ok(())
+}
+
+fn validate_relative_file(value: &str) -> Result<(), HelperError> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.contains('\0')
+        || value.contains('\n')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(HelperError::Rejected("invalid snapshot file path".into()));
+    }
+    Ok(())
+}
+
+fn relative_snapshot_file(root: &Path, value: &str) -> Result<String, HelperError> {
+    let relative = Path::new(value)
+        .strip_prefix(root)
+        .map_err(|_| HelperError::Rejected("snapshot file outside root".into()))?;
+    let text = relative.to_string_lossy().trim_start_matches('/').to_string();
+    validate_relative_file(&text)?;
+    Ok(text)
+}
+
 fn render_samba_share(name: &str, path: &str, allowed_users: &[String], readonly: bool) -> String {
     let mut lines = vec![
         format!("[{name}]"),
@@ -916,6 +1244,27 @@ fn render_samba_share(name: &str, path: &str, allowed_users: &[String], readonly
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+fn render_samba_server_settings(
+    workgroup: &str,
+    server_string: &str,
+    netbios_name: &str,
+    security: &str,
+    map_to_guest: &str,
+    log_level: &str,
+) -> String {
+    [
+        "[global]".to_string(),
+        format!("    workgroup = {workgroup}"),
+        format!("    server string = {server_string}"),
+        format!("    netbios name = {netbios_name}"),
+        format!("    security = {security}"),
+        format!("    map to guest = {map_to_guest}"),
+        format!("    log level = {log_level}"),
+        String::new(),
+    ]
+    .join("\n")
 }
 
 fn render_nfs_export(path: &str, clients: &str, options: &str) -> String {
@@ -1208,6 +1557,9 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
         HelperOperation::DeleteSnapshot { snapshot }
         | HelperOperation::RollbackSnapshot { snapshot } => ("snapshot".into(), snapshot.clone()),
         HelperOperation::SetQuota { dataset, .. } => ("quota".into(), dataset.clone()),
+        HelperOperation::ApplySambaServerSettings { workgroup, .. } => {
+            ("samba_settings".into(), workgroup.clone())
+        }
         HelperOperation::ApplySambaShare { name, .. }
         | HelperOperation::DeleteSambaShare { name } => ("samba".into(), name.clone()),
         HelperOperation::UpsertSambaUser { username, .. }
@@ -1220,6 +1572,12 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
             "logs".into(),
             service.clone().unwrap_or_else(|| "all".into()),
         ),
+        HelperOperation::SearchSnapshotFiles { snapshot, .. } => {
+            ("snapshot_files".into(), snapshot.clone())
+        }
+        HelperOperation::RestoreSnapshotFiles { snapshot, .. } => {
+            ("snapshot_restore".into(), snapshot.clone())
+        }
     }
 }
 
@@ -1322,6 +1680,29 @@ mod tests {
 
         let nfs = render_nfs_export("/mnt/tank/media", "192.168.1.0/24", "-maproot=root");
         assert_eq!(nfs, "/mnt/tank/media -maproot=root 192.168.1.0/24\n");
+    }
+
+    #[test]
+    fn renders_samba_server_settings_fragment() {
+        let settings = render_samba_server_settings(
+            "HOME",
+            "Home NAS",
+            "BNAS",
+            "user",
+            "Bad User",
+            "2",
+        );
+        assert!(settings.contains("[global]"));
+        assert!(settings.contains("workgroup = HOME"));
+        assert!(settings.contains("netbios name = BNAS"));
+        assert!(settings.contains("map to guest = Bad User"));
+    }
+
+    #[test]
+    fn snapshot_file_paths_must_be_relative() {
+        assert!(validate_relative_file("docs/report.txt").is_ok());
+        assert!(validate_relative_file("/docs/report.txt").is_err());
+        assert!(validate_relative_file("../report.txt").is_err());
     }
 
     #[test]
