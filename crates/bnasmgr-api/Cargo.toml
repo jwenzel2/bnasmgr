@@ -1,0 +1,27 @@
+[package]
+name = "bnasmgr-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2 = "0.5"
+axum.workspace = true
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+bnasmgr-helper = { path = "../bnasmgr-helper" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sqlx.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower = "0.5"

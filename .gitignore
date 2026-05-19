@@ -1,0 +1,7 @@
+/target/
+/bnasmgr.db*
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.svelte-kit/
+/certs/
+*.log
