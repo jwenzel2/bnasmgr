@@ -1017,6 +1017,12 @@ struct SnapshotTask {
     updated_at: String,
 }
 
+#[derive(Debug)]
+struct SnapshotRetentionCandidate {
+    name: String,
+    created_at: DateTime<Utc>,
+}
+
 fn row_to_snapshot_task(row: sqlx::sqlite::SqliteRow) -> SnapshotTask {
     SnapshotTask {
         id: row.get("id"),
@@ -1145,16 +1151,91 @@ async fn run_snapshot_task(
     }
     let label = format!("{}-{}", task.prefix, Utc::now().format("%Y%m%d-%H%M%S"));
     validate_snapshot_label(&label)?;
-    let data = state
+    let created_snapshot = format!("{}@{}", task.dataset, label);
+    let created = state
         .helper(
             &user.username,
             HelperOperation::CreateSnapshot {
-                dataset: task.dataset,
+                dataset: task.dataset.clone(),
                 name: label,
             },
         )
         .await?;
-    Ok(Json(data))
+    let retention_deleted =
+        enforce_snapshot_task_retention(&state, &user.username, &task, &created_snapshot).await?;
+    Ok(Json(serde_json::json!({
+        "created": created,
+        "retention_deleted": retention_deleted,
+    })))
+}
+
+async fn enforce_snapshot_task_retention(
+    state: &AppState,
+    actor: &str,
+    task: &SnapshotTask,
+    created_snapshot: &str,
+) -> Result<Vec<String>, ApiError> {
+    let snapshots = state
+        .helper(
+            actor,
+            HelperOperation::ListSnapshots {
+                dataset: Some(task.dataset.clone()),
+            },
+        )
+        .await?;
+    let prefix = format!("{}@{}-", task.dataset, task.prefix);
+    let mut candidates = snapshots
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|snapshot| {
+            let name = snapshot.get("name")?.as_str()?;
+            if !name.starts_with(&prefix) {
+                return None;
+            }
+            let created_at = snapshot
+                .get("created_at")
+                .and_then(|value| value.as_str())
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            Some(SnapshotRetentionCandidate {
+                name: name.to_string(),
+                created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.name == created_snapshot)
+    {
+        candidates.push(SnapshotRetentionCandidate {
+            name: created_snapshot.to_string(),
+            created_at: Utc::now(),
+        });
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.name.cmp(&left.name))
+    });
+
+    let keep = task.retention_count.max(1) as usize;
+    let mut deleted = Vec::new();
+    for candidate in candidates.into_iter().skip(keep) {
+        state
+            .helper(
+                actor,
+                HelperOperation::DeleteSnapshot {
+                    snapshot: candidate.name.clone(),
+                },
+            )
+            .await?;
+        deleted.push(candidate.name);
+    }
+    Ok(deleted)
 }
 
 async fn delete_snapshot(
@@ -2315,7 +2396,7 @@ mod tests {
                     .header("authorization", format!("Bearer {token}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"dataset":"tank/media","prefix":"auto","cadence":"daily","retention_count":14,"enabled":true}"#,
+                        r#"{"dataset":"tank/media","prefix":"daily","cadence":"daily","retention_count":1,"enabled":true}"#,
                     ))
                     .unwrap(),
             )
@@ -2326,7 +2407,7 @@ mod tests {
         let task: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let id = task["id"].as_str().unwrap();
         assert_eq!(task["dataset"], "tank/media");
-        assert_eq!(task["retention_count"], 14);
+        assert_eq!(task["retention_count"], 1);
 
         let response = app
             .clone()
@@ -2341,6 +2422,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(run["retention_deleted"][0], "tank/media@daily-2026-05-18");
 
         let response = app
             .clone()

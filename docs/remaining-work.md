@@ -15,6 +15,7 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - Service monitoring/control for `zfs`, `samba_server`, `nfsd`, `mountd`, `rpcbind`, `ctld`, and `syslogd`.
 - Helper history redacts Samba passwords.
 - Destructive snapshot delete/rollback requires an exact `X-BNASMGR-CONFIRM` header.
+- Snapshot tasks can be stored, manually run, and pruned by retention count for matching task-created snapshot prefixes.
 - FreeBSD deployment notes and manual smoke checklist.
 
 ## Traditional NAS Feature Plan
@@ -47,7 +48,7 @@ The latest local verification passed with these commands.
 
 ## Still Left
 
-- Execute scheduled snapshot tasks automatically from a durable scheduler and enforce retention by deleting old matching snapshots.
+- Execute scheduled snapshot tasks automatically from a durable scheduler instead of requiring manual "Run now" calls.
 - Run the FreeBSD manual acceptance checklist on an actual FreeBSD host with a disposable ZFS pool/dataset.
 - Wire and validate Samba include fragments on the exact Samba package version installed on the target host.
 - Wire and validate NFS export fragment consumption before relying on generated exports in production.
