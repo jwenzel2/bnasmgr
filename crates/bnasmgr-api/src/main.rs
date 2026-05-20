@@ -55,6 +55,46 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    if std::env::var("BNASMGR_REPLICATION_SCHEDULER").as_deref() != Ok("off") {
+        let scheduler_state = state.clone();
+        let interval_seconds = std::env::var("BNASMGR_REPLICATION_SCHEDULER_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 10)
+            .unwrap_or(60);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+            loop {
+                interval.tick().await;
+                match scheduler_state.run_due_replication_tasks().await {
+                    Ok(ran) if ran > 0 => tracing::info!(ran, "scheduled replication tasks ran"),
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(?err, "scheduled replication task scan failed"),
+                }
+            }
+        });
+    }
+    if std::env::var("BNASMGR_ALERT_NOTIFIER").as_deref() != Ok("off") {
+        let notifier_state = state.clone();
+        let interval_seconds = std::env::var("BNASMGR_ALERT_NOTIFIER_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 30)
+            .unwrap_or(300);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+            loop {
+                interval.tick().await;
+                match notifier_state.run_alert_notifications().await {
+                    Ok(sent) if sent > 0 => {
+                        tracing::info!(sent, "alert notification delivery attempts queued")
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(?err, "alert notification scan failed"),
+                }
+            }
+        });
+    }
 
     let addr: SocketAddr = bind.parse().context("parse BNASMGR_BIND")?;
     let router = app(state);

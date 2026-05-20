@@ -9,19 +9,25 @@
   let storage = { pools: [], datasets: [] };
   let scrubStatus = {};
   let disks = [];
+  let smartTestHistory = {};
   let snapshots = [];
   let snapshotTasks = [];
+  let replicationTasks = [];
   let services = [];
   let sambaShares = [];
   let sambaSettings = { workgroup: 'WORKGROUP', server_string: 'bnasmgr NAS', netbios_name: 'BNASMGR', security: 'user', map_to_guest: 'Bad User', log_level: '1' };
   let sambaUsers = [];
   let nfsShares = [];
+  let alerts = [];
+  let alertNotifications = { enabled: false, min_severity: 'warning', webhook_url: '', email_to: '', smtp_host: '', smtp_port: 25, smtp_from: '' };
+  let alertNotificationHistory = [];
   let logs = [];
   let audit = [];
   let helperHistory = [];
   let users = [];
   let snapshotForm = { dataset: 'tank/media', name: '' };
   let snapshotTaskForm = { dataset: 'tank/media', prefix: 'auto', cadence: 'daily', retention_count: 14, enabled: true };
+  let replicationTaskForm = { source_dataset: 'tank/media', destination_dataset: 'backup/media', mode: 'local', remote_host: '', remote_user: '', cadence: 'daily', enabled: true };
   let snapshotFileSnapshot = '';
   let snapshotFileSearch = '';
   let snapshotFiles = [];
@@ -62,7 +68,7 @@
 
   async function loadAll() {
     if (!token || user?.must_change_password) return;
-    await Promise.all([loadStorage(), loadDiskHealth(), loadSnapshots(), loadSnapshotTasks(), loadServices(), loadShares(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
+    await Promise.all([loadStorage(), loadDiskHealth(), loadSnapshots(), loadSnapshotTasks(), loadReplicationTasks(), loadServices(), loadShares(), loadAlerts(), loadAlertNotifications(), loadAlertNotificationHistory(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
   }
 
   async function restoreSession() {
@@ -97,6 +103,24 @@
   async function scrubAction(pool, action) {
     await request(`/api/storage/pools/${encodeURIComponent(pool)}/scrub/${action}`, { method: 'POST' });
     await loadScrubStatuses();
+  }
+
+  async function loadSmartTests(disk) {
+    const params = new URLSearchParams({ device: disk.name });
+    if (disk.device_type && disk.device_type !== 'auto') params.set('device_type', disk.device_type);
+    smartTestHistory = { ...smartTestHistory, [disk.name]: await request(`/api/storage/disks/tests?${params}`) };
+  }
+
+  async function startSmartTest(disk, test) {
+    await request('/api/storage/disks/tests', {
+      method: 'POST',
+      body: JSON.stringify({
+        device: disk.name,
+        device_type: disk.device_type === 'auto' ? null : disk.device_type,
+        test
+      })
+    });
+    await loadSmartTests(disk);
   }
 
   async function setQuota(dataset, event) {
@@ -148,6 +172,30 @@
   async function runSnapshotTask(id) {
     await request(`/api/snapshots/tasks/${encodeURIComponent(id)}/run`, { method: 'POST' });
     await Promise.all([loadSnapshots(), loadSnapshotTasks()]);
+  }
+
+  async function loadReplicationTasks() {
+    replicationTasks = await request('/api/replication/tasks');
+  }
+
+  async function createReplicationTask() {
+    await request('/api/replication/tasks', {
+      method: 'POST',
+      body: JSON.stringify(replicationTaskForm)
+    });
+    replicationTaskForm = { ...replicationTaskForm, remote_host: '', remote_user: '' };
+    await loadReplicationTasks();
+  }
+
+  async function deleteReplicationTask(id, source) {
+    if (!confirm(`Delete replication task for ${source}?`)) return;
+    await request(`/api/replication/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await loadReplicationTasks();
+  }
+
+  async function runReplicationTask(id) {
+    await request(`/api/replication/tasks/${encodeURIComponent(id)}/run`, { method: 'POST' });
+    await loadReplicationTasks();
   }
 
   async function deleteSnapshot(name) {
@@ -261,6 +309,30 @@
     logs = await request(`/api/logs?${params}`);
   }
 
+  async function loadAlerts() {
+    alerts = await request('/api/alerts');
+  }
+
+  async function loadAlertNotifications() {
+    alertNotifications = await request('/api/alerts/notifications');
+  }
+
+  async function loadAlertNotificationHistory() {
+    alertNotificationHistory = await request('/api/alerts/notifications/history');
+  }
+
+  async function saveAlertNotifications() {
+    alertNotifications = await request('/api/alerts/notifications', {
+      method: 'POST',
+      body: JSON.stringify(alertNotifications)
+    });
+  }
+
+  async function testAlertNotifications() {
+    await request('/api/alerts/notifications/test', { method: 'POST' });
+    await Promise.all([loadAlertNotificationHistory(), loadAudit()]);
+  }
+
   async function loadAudit() {
     audit = await request('/api/audit');
   }
@@ -359,7 +431,7 @@
   <div class="shell">
     <aside>
       <div class="brand">bnasmgr</div>
-      {#each ['storage', 'snapshots', 'shares', 'services', 'logs', 'audit', 'users'] as tab}
+      {#each ['storage', 'snapshots', 'shares', 'services', 'alerts', 'logs', 'audit', 'users'] as tab}
         <button class:active={active === tab} on:click={() => active = tab}>{tab}</button>
       {/each}
       <button on:click={logout}>logout</button>
@@ -429,7 +501,35 @@
                     <td>{disk.serial}</td>
                     <td>{disk.device_type}</td>
                     <td><span class="status {disk.state === 'ok' ? 'green' : disk.state === 'fail' ? 'red' : 'yellow'}">{disk.smart_status}</span></td>
+                    <td>
+                      <div class="row-actions">
+                        <button on:click={() => startSmartTest(disk, 'short')}>Short test</button>
+                        <button on:click={() => startSmartTest(disk, 'long')}>Long test</button>
+                        <button on:click={() => startSmartTest(disk, 'conveyance')}>Conveyance</button>
+                        <button on:click={() => loadSmartTests(disk)}>History</button>
+                      </div>
+                    </td>
                   </tr>
+                  {#if smartTestHistory[disk.name]?.length}
+                    <tr>
+                      <td colspan="6">
+                        <table class="nested-table">
+                          <tbody>
+                            {#each smartTestHistory[disk.name] as test}
+                              <tr>
+                                <td>#{test.number}</td>
+                                <td>{test.description}</td>
+                                <td>{test.status}</td>
+                                <td>{test.remaining}</td>
+                                <td>{test.lifetime_hours}h</td>
+                                <td>{test.lba_of_first_error}</td>
+                              </tr>
+                            {/each}
+                          </tbody>
+                        </table>
+                      </td>
+                    </tr>
+                  {/if}
                 {/each}
               </tbody>
             </table>
@@ -469,6 +569,43 @@
                     <td>{task.enabled ? 'enabled' : 'disabled'}</td>
                     <td>{task.last_run_at || 'never run'}</td>
                     <td><button disabled={!task.enabled} on:click={() => runSnapshotTask(task.id)}>Run now</button><button on:click={() => deleteSnapshotTask(task.id, task.prefix)}>Delete</button></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+          <div class="subpanel">
+            <h2>Replication tasks</h2>
+            <form class="inline" on:submit|preventDefault={createReplicationTask}>
+              <input bind:value={replicationTaskForm.source_dataset} placeholder="source dataset" />
+              <input bind:value={replicationTaskForm.destination_dataset} placeholder="destination dataset" />
+              <select bind:value={replicationTaskForm.mode}>
+                <option value="local">local</option>
+                <option value="remote">remote</option>
+              </select>
+              <input bind:value={replicationTaskForm.remote_host} placeholder="remote host" disabled={replicationTaskForm.mode === 'local'} />
+              <input bind:value={replicationTaskForm.remote_user} placeholder="remote user" disabled={replicationTaskForm.mode === 'local'} />
+              <select bind:value={replicationTaskForm.cadence}>
+                <option value="hourly">hourly</option>
+                <option value="daily">daily</option>
+                <option value="weekly">weekly</option>
+                <option value="monthly">monthly</option>
+              </select>
+              <label class="check"><input type="checkbox" bind:checked={replicationTaskForm.enabled} /> Enabled</label>
+              <button>Save replication</button>
+            </form>
+            <table>
+              <tbody>
+                {#each replicationTasks as task}
+                  <tr>
+                    <td>{task.source_dataset}</td>
+                    <td>{task.destination_dataset}</td>
+                    <td>{task.mode}</td>
+                    <td>{task.remote_host || 'local'}</td>
+                    <td>{task.cadence}</td>
+                    <td>{task.enabled ? 'enabled' : 'disabled'}</td>
+                    <td>{task.last_run_at || 'never run'}</td>
+                    <td><button disabled={!task.enabled} on:click={() => runReplicationTask(task.id)}>Run now</button><button on:click={() => deleteReplicationTask(task.id, task.source_dataset)}>Delete</button></td>
                   </tr>
                 {/each}
               </tbody>
@@ -553,6 +690,74 @@
               <div class="actions"><button on:click={() => serviceAction(svc.name, 'start')}>Start</button><button on:click={() => serviceAction(svc.name, 'stop')}>Stop</button><button on:click={() => serviceAction(svc.name, 'restart')}>Restart</button></div>
             </article>
           {/each}
+        </section>
+      {:else if active === 'alerts'}
+        <section class="split">
+          <div class="panel">
+            <div class="toolbar">
+              <h2>Alerts</h2>
+              <button on:click={loadAlerts}>Refresh</button>
+            </div>
+            {#if alerts.length}
+              <table>
+                <tbody>
+                  {#each alerts as item}
+                    <tr>
+                      <td><span class="status {item.severity === 'critical' ? 'red' : 'yellow'}">{item.severity}</span></td>
+                      <td>{item.category}</td>
+                      <td>{item.target}</td>
+                      <td>{item.message}</td>
+                      <td>{item.created_at}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {:else}
+              <p class="empty">No active alerts</p>
+            {/if}
+          </div>
+          <div class="panel">
+            <h2>Notifications</h2>
+            <form class="stack" on:submit|preventDefault={saveAlertNotifications}>
+              <label class="check"><input type="checkbox" bind:checked={alertNotifications.enabled} /> Enabled</label>
+              <select bind:value={alertNotifications.min_severity}>
+                <option value="warning">warning</option>
+                <option value="critical">critical</option>
+              </select>
+              <input bind:value={alertNotifications.webhook_url} placeholder="webhook URL" />
+              <input bind:value={alertNotifications.email_to} placeholder="email recipient" />
+              <input bind:value={alertNotifications.smtp_host} placeholder="SMTP host" />
+              <input bind:value={alertNotifications.smtp_port} type="number" min="1" max="65535" placeholder="SMTP port" />
+              <input bind:value={alertNotifications.smtp_from} placeholder="SMTP sender" />
+              <div class="actions">
+                <button>Save notifications</button>
+                <button type="button" disabled={!alertNotifications.enabled} on:click={testAlertNotifications}>Test</button>
+              </div>
+            </form>
+            <div class="subpanel">
+              <div class="toolbar">
+                <h2>Delivery history</h2>
+                <button on:click={loadAlertNotificationHistory}>Refresh</button>
+              </div>
+              {#if alertNotificationHistory.length}
+                <table>
+                  <tbody>
+                    {#each alertNotificationHistory as item}
+                      <tr>
+                        <td>{item.created_at}</td>
+                        <td>{item.channel}</td>
+                        <td><span class="status {item.severity === 'critical' ? 'red' : 'yellow'}">{item.severity}</span></td>
+                        <td>{item.target}</td>
+                        <td>{item.result}</td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              {:else}
+                <p class="empty">No notification attempts</p>
+              {/if}
+            </div>
+          </div>
         </section>
       {:else if active === 'logs'}
         <section class="panel">

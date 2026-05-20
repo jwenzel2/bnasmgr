@@ -14,10 +14,14 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - FreeBSD command construction/parsing for ZFS storage, snapshots, quotas, services, logs, Samba users, and Samba/NFS fragment application.
 - Service monitoring/control for `zfs`, `samba_server`, `nfsd`, `mountd`, `rpcbind`, `ctld`, and `syslogd`.
 - Pool scrub status plus start/stop controls.
-- SMART disk health inventory.
+- SMART disk health inventory with self-test launch and history.
+- Computed alerts for degraded pools, unhealthy disks, stopped services, and failed helper operations.
+- Alert notification channel settings with validation and test audit events.
+- Background alert notification scan with plain HTTP webhook delivery, plain SMTP relay delivery, and per-channel deduped delivery history.
 - Helper history redacts Samba passwords.
 - Destructive snapshot delete/rollback requires an exact `X-BNASMGR-CONFIRM` header.
 - Snapshot tasks can be stored, run automatically by the API scheduler, manually run, and pruned by retention count for matching task-created snapshot prefixes.
+- Replication tasks can be stored, manually run, and automatically run by the API scheduler for local and remote ZFS send/receive.
 - FreeBSD deployment notes and manual smoke checklist.
 
 ## Traditional NAS Feature Plan
@@ -25,9 +29,8 @@ The recovered MVP implementation plan is functionally complete in this repo:
 The next implementation track is modeled after common TrueNAS-style NAS administration:
 
 - Scheduled snapshot tasks with cadence and retention metadata.
-- SMART disk test launch and result history.
-- Alerts and notifications for degraded pools, failed helper operations, disk health, and service failures.
-- Replication tasks for local and remote ZFS send/receive.
+- HTTPS webhook transport plus authenticated/TLS SMTP support.
+- Retention-aware incremental replication send/receive.
 - Dataset CRUD, including compression, atime, quota, reservation, and mountpoint controls.
 - Snapshot clone/diff workflows to improve point-in-time recovery.
 - Full iSCSI target/extent/LUN CRUD.

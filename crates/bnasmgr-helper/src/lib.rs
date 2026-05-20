@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    process::Stdio,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
@@ -22,6 +23,15 @@ pub enum ServiceAction {
 pub enum HelperOperation {
     ListStorage,
     ListSmartDisks,
+    StartSmartTest {
+        device: String,
+        device_type: Option<String>,
+        test: String,
+    },
+    ListSmartSelfTests {
+        device: String,
+        device_type: Option<String>,
+    },
     PoolScrubStatus {
         pool: String,
     },
@@ -100,6 +110,12 @@ pub enum HelperOperation {
     RestoreSnapshotFiles {
         snapshot: String,
         files: Vec<String>,
+    },
+    RunReplication {
+        snapshot: String,
+        destination_dataset: String,
+        remote_host: Option<String>,
+        remote_user: Option<String>,
     },
 }
 
@@ -202,6 +218,22 @@ impl HelperClient for MockHelper {
                 data: serde_json::json!([
                     {"name":"/dev/ada0","device_type":"ata","model":"Mock SSD","serial":"MOCK0001","smart_status":"passed","state":"ok"},
                     {"name":"/dev/ada1","device_type":"ata","model":"Mock HDD","serial":"MOCK0002","smart_status":"passed","state":"ok"}
+                ]),
+            },
+            HelperOperation::StartSmartTest { device, test, .. } => HelperResponse {
+                ok: true,
+                category: "smart_test".into(),
+                target: device,
+                message: format!("mock {test} SMART test started"),
+                data: serde_json::json!({ "test": test }),
+            },
+            HelperOperation::ListSmartSelfTests { device, .. } => HelperResponse {
+                ok: true,
+                category: "smart_test".into(),
+                target: device,
+                message: "mock SMART self-test history loaded".into(),
+                data: serde_json::json!([
+                    {"number":1,"description":"Short offline","status":"Completed without error","remaining":"00%","lifetime_hours":"1234","lba_of_first_error":"-"}
                 ]),
             },
             HelperOperation::PoolScrubStatus { pool } => HelperResponse {
@@ -404,6 +436,22 @@ impl HelperClient for MockHelper {
                 message: format!("{} file(s) restored from snapshot", files.len()),
                 data: serde_json::json!({ "restored": files }),
             },
+            HelperOperation::RunReplication {
+                snapshot,
+                destination_dataset,
+                remote_host,
+                ..
+            } => HelperResponse {
+                ok: true,
+                category: "replication".into(),
+                target: destination_dataset.clone(),
+                message: "mock replication completed".into(),
+                data: serde_json::json!({
+                    "snapshot": snapshot,
+                    "destination_dataset": destination_dataset,
+                    "remote": remote_host.is_some()
+                }),
+            },
         };
         Ok(response)
     }
@@ -492,6 +540,43 @@ impl FreeBsdCommandBuilder {
                 "name,used,avail,quota,mountpoint".into(),
             ],
             HelperOperation::ListSmartDisks => vec!["smartctl".into(), "--scan".into()],
+            HelperOperation::StartSmartTest {
+                device,
+                device_type,
+                test,
+            } => {
+                safe_arg(device)?;
+                if let Some(device_type) = device_type {
+                    safe_arg(device_type)?;
+                }
+                safe_arg(test)?;
+                if !matches!(test.as_str(), "short" | "long" | "conveyance") {
+                    return Err(HelperError::Rejected("invalid SMART test type".into()));
+                }
+                let mut cmd = vec!["smartctl".into(), "-t".into(), test.clone()];
+                if let Some(device_type) = device_type {
+                    cmd.push("-d".into());
+                    cmd.push(device_type.clone());
+                }
+                cmd.push(device.clone());
+                cmd
+            }
+            HelperOperation::ListSmartSelfTests {
+                device,
+                device_type,
+            } => {
+                safe_arg(device)?;
+                if let Some(device_type) = device_type {
+                    safe_arg(device_type)?;
+                }
+                let mut cmd = vec!["smartctl".into(), "-l".into(), "selftest".into()];
+                if let Some(device_type) = device_type {
+                    cmd.push("-d".into());
+                    cmd.push(device_type.clone());
+                }
+                cmd.push(device.clone());
+                cmd
+            }
             HelperOperation::PoolScrubStatus { pool } => {
                 safe_arg(pool)?;
                 vec!["zpool".into(), "status".into(), pool.clone()]
@@ -672,6 +757,31 @@ impl FreeBsdCommandBuilder {
                 }
                 vec!["cp".into(), "-p".into()]
             }
+            HelperOperation::RunReplication {
+                snapshot,
+                destination_dataset,
+                remote_host,
+                remote_user,
+            } => {
+                safe_arg(snapshot)?;
+                safe_arg(destination_dataset)?;
+                if let Some(host) = remote_host {
+                    safe_arg(host)?;
+                }
+                if let Some(user) = remote_user {
+                    safe_arg(user)?;
+                }
+                vec![
+                    "zfs".into(),
+                    "send".into(),
+                    snapshot.clone(),
+                    "|".into(),
+                    "zfs".into(),
+                    "receive".into(),
+                    "-F".into(),
+                    destination_dataset.clone(),
+                ]
+            }
         };
         Ok(cmd)
     }
@@ -710,6 +820,9 @@ impl HelperClient for FreeBsdHelper {
         match &operation {
             HelperOperation::ListStorage => return freebsd_storage_overview().await,
             HelperOperation::ListSmartDisks => return freebsd_smart_disks().await,
+            HelperOperation::ListSmartSelfTests { .. } => {
+                return freebsd_smart_self_tests(&operation).await
+            }
             HelperOperation::PoolScrubStatus { .. } => {
                 return freebsd_pool_scrub_status(&operation).await
             }
@@ -733,6 +846,9 @@ impl HelperClient for FreeBsdHelper {
             }
             HelperOperation::RestoreSnapshotFiles { .. } => {
                 return freebsd_restore_snapshot_files(&operation).await
+            }
+            HelperOperation::RunReplication { .. } => {
+                return freebsd_run_replication(&operation).await
             }
             _ => {}
         }
@@ -909,6 +1025,29 @@ async fn freebsd_smart_disks() -> Result<HelperResponse, HelperError> {
         target: "all".into(),
         message: "disk health loaded".into(),
         data: serde_json::json!(disks),
+    })
+}
+
+async fn freebsd_smart_self_tests(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let cmd = FreeBsdCommandBuilder::build(operation)?;
+    let output = run_command(cmd).await?;
+    let (category, target) = operation_category_target(operation);
+    Ok(HelperResponse {
+        ok: output.ok,
+        category,
+        target,
+        message: if output.ok {
+            "SMART self-test history loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            serde_json::json!(parse_smartctl_selftests(&output.stdout))
+        } else {
+            serde_json::json!([])
+        },
     })
 }
 
@@ -1213,6 +1352,104 @@ async fn freebsd_restore_snapshot_files(
         target: snapshot.clone(),
         message: format!("{} file(s) restored from snapshot", restored.len()),
         data: serde_json::json!({ "restored": restored }),
+    })
+}
+
+async fn freebsd_run_replication(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::RunReplication {
+        snapshot,
+        destination_dataset,
+        remote_host,
+        remote_user,
+    } = operation
+    else {
+        return Err(HelperError::Rejected(
+            "expected replication operation".into(),
+        ));
+    };
+    validate_snapshot_name(snapshot)?;
+    FreeBsdCommandBuilder::build(operation)?;
+
+    let mut send = Command::new("zfs")
+        .arg("send")
+        .arg(snapshot)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|err| HelperError::Other(err.into()))?;
+    let mut send_stdout = send
+        .stdout
+        .take()
+        .ok_or_else(|| HelperError::Rejected("zfs send stdout unavailable".into()))?;
+
+    let mut receive = if let Some(host) = remote_host {
+        let target = format!(
+            "{}{}",
+            remote_user
+                .as_ref()
+                .map(|user| format!("{user}@"))
+                .unwrap_or_default(),
+            host
+        );
+        let mut cmd = Command::new("ssh");
+        cmd.arg(target)
+            .arg("zfs")
+            .arg("receive")
+            .arg("-F")
+            .arg(destination_dataset);
+        cmd
+    } else {
+        let mut cmd = Command::new("zfs");
+        cmd.arg("receive").arg("-F").arg(destination_dataset);
+        cmd
+    };
+    let mut receive = receive
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| HelperError::Other(err.into()))?;
+    let mut receive_stdin = receive
+        .stdin
+        .take()
+        .ok_or_else(|| HelperError::Rejected("zfs receive stdin unavailable".into()))?;
+    let mut buffer = Vec::new();
+    send_stdout
+        .read_to_end(&mut buffer)
+        .await
+        .map_err(|err| HelperError::Other(err.into()))?;
+    receive_stdin
+        .write_all(&buffer)
+        .await
+        .map_err(|err| HelperError::Other(err.into()))?;
+    drop(receive_stdin);
+    let receive_output = receive
+        .wait_with_output()
+        .await
+        .map_err(|err| HelperError::Other(err.into()))?;
+    let send_status = send
+        .wait()
+        .await
+        .map_err(|err| HelperError::Other(err.into()))?;
+    let ok = send_status.success() && receive_output.status.success();
+    let stderr = String::from_utf8_lossy(&receive_output.stderr).to_string();
+    Ok(HelperResponse {
+        ok,
+        category: "replication".into(),
+        target: destination_dataset.clone(),
+        message: if ok {
+            "replication completed".into()
+        } else {
+            stderr.clone()
+        },
+        data: serde_json::json!({
+            "snapshot": snapshot,
+            "destination_dataset": destination_dataset,
+            "remote": remote_host.is_some(),
+            "send_status": send_status.code(),
+            "receive_status": receive_output.status.code(),
+            "stderr": stderr,
+        }),
     })
 }
 
@@ -1599,6 +1836,38 @@ fn first_smart_value(stdout: &str, keys: &[&str]) -> Option<String> {
     })
 }
 
+fn parse_smartctl_selftests(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('#'))
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 8 {
+                return None;
+            }
+            let (number, description_start) = if parts[0] == "#" {
+                (parts.get(1)?.parse::<u32>().ok()?, 2)
+            } else {
+                (parts[0].trim_start_matches('#').parse::<u32>().ok()?, 1)
+            };
+            let remaining_idx = parts.iter().position(|part| part.ends_with('%'))?;
+            let status_start = description_start + 2;
+            if remaining_idx <= status_start || remaining_idx + 2 >= parts.len() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "number": number,
+                "description": parts[description_start..status_start].join(" "),
+                "status": parts[status_start..remaining_idx].join(" ").replace('_', " "),
+                "remaining": parts[remaining_idx],
+                "lifetime_hours": parts[remaining_idx + 1],
+                "lba_of_first_error": parts[remaining_idx + 2],
+            }))
+        })
+        .collect()
+}
+
 fn parse_snapshot_counts(stdout: &str) -> BTreeMap<String, u32> {
     let mut counts = BTreeMap::new();
     for line in stdout.lines() {
@@ -1805,6 +2074,10 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
     match operation {
         HelperOperation::ListStorage => ("storage".into(), "overview".into()),
         HelperOperation::ListSmartDisks => ("disk_health".into(), "all".into()),
+        HelperOperation::StartSmartTest { device, .. }
+        | HelperOperation::ListSmartSelfTests { device, .. } => {
+            ("smart_test".into(), device.clone())
+        }
         HelperOperation::PoolScrubStatus { pool }
         | HelperOperation::PoolScrubAction { pool, .. } => ("pool_scrub".into(), pool.clone()),
         HelperOperation::ListSnapshots { dataset } => (
@@ -1838,6 +2111,10 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
         HelperOperation::RestoreSnapshotFiles { snapshot, .. } => {
             ("snapshot_restore".into(), snapshot.clone())
         }
+        HelperOperation::RunReplication {
+            destination_dataset,
+            ..
+        } => ("replication".into(), destination_dataset.clone()),
     }
 }
 
@@ -1901,6 +2178,71 @@ mod tests {
     fn smart_disk_scan_command_is_read_only() {
         let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ListSmartDisks).unwrap();
         assert_eq!(cmd, vec!["smartctl", "--scan"]);
+    }
+
+    #[test]
+    fn smart_test_commands_are_allowlisted() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::StartSmartTest {
+            device: "/dev/ada0".into(),
+            device_type: Some("ata".into()),
+            test: "short".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            cmd,
+            vec!["smartctl", "-t", "short", "-d", "ata", "/dev/ada0"]
+        );
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::StartSmartTest {
+            device: "/dev/ada0".into(),
+            device_type: None,
+            test: "bad".into(),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid SMART test type"));
+    }
+
+    #[test]
+    fn replication_command_builder_rejects_unsafe_targets() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::RunReplication {
+            snapshot: "tank/media@repl-20260520".into(),
+            destination_dataset: "backup/media".into(),
+            remote_host: None,
+            remote_user: None,
+        })
+        .unwrap();
+        assert_eq!(
+            cmd,
+            vec![
+                "zfs",
+                "send",
+                "tank/media@repl-20260520",
+                "|",
+                "zfs",
+                "receive",
+                "-F",
+                "backup/media"
+            ]
+        );
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::RunReplication {
+            snapshot: "tank/media@bad;rm".into(),
+            destination_dataset: "backup/media".into(),
+            remote_host: None,
+            remote_user: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("unsafe command argument"));
+    }
+
+    #[test]
+    fn parses_smart_selftest_history() {
+        let rows = parse_smartctl_selftests(
+            "# 1  Short offline       Completed without error       00%      1234         -\n",
+        );
+        assert_eq!(rows[0]["description"], "Short offline");
+        assert_eq!(rows[0]["status"], "Completed without error");
+        assert_eq!(rows[0]["lifetime_hours"], "1234");
     }
 
     #[test]

@@ -38,6 +38,14 @@ h1 { font-size: 24px; }
 h2 { font-size: 16px; }
 table { width: 100%; border-collapse: collapse; }
 td { border-bottom: 1px solid #e1e7e4; padding: 10px 8px; vertical-align: top; }
+.nested-table {
+  background: #f8faf9;
+  border: 1px solid #e1e7e4;
+}
+.nested-table td {
+  font-size: 13px;
+  padding: 8px;
+}
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; margin: 16px 0 0; }
 dt { color: #607068; }
 dd { margin: 0; overflow-wrap: anywhere; }
@@ -74,6 +82,17 @@ header { display: flex; justify-content: space-between; align-items: center; mar
 .split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .inline { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: center; margin-bottom: 16px; }
 .stack { display: grid; gap: 10px; margin: 14px 0; }
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.empty {
+  margin: 0;
+  color: #607068;
+}
 .check { display: flex; align-items: center; gap: 8px; color: #35443c; }
 .check input { width: auto; min-height: auto; }
 .pool-card {

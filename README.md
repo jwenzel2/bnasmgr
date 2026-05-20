@@ -51,11 +51,16 @@ All routes are under `/api`:
 - `/api/auth/*`
 - `/api/users` for listing, creating, deleting, role changes, and password resets
 - `/api/storage/*`
+- `/api/storage/disks/tests` for SMART self-test launch and history
 - `/api/snapshots/*`
 - `/api/snapshots/:snapshot/files` for searching snapshot contents and restoring selected files
+- `/api/replication/tasks` for local and remote ZFS replication task definitions and manual runs
 - `/api/shares/samba/*` including server settings, shares, and Samba users
 - `/api/shares/nfs/*`
 - `/api/services/*`
+- `/api/alerts` for computed storage, disk, service, and helper-failure alerts
+- `/api/alerts/notifications` for alert notification channel settings
+- `/api/alerts/notifications/history` for queued alert notification attempts
 - `/api/logs`
 - `/api/audit` and `/api/audit/helper-history`
 
@@ -72,6 +77,10 @@ Dashboard admins can manage common Samba server settings such as workgroup, serv
 Samba and NFS share application writes helper-owned config fragments atomically before service reload. The default FreeBSD fragment roots are `/usr/local/etc/bnasmgr/smb4.includes` and `/usr/local/etc/bnasmgr/exports.d`.
 
 The log viewer supports service, severity, search text, and date-range filters. FreeBSD syslog-style timestamps are parsed using the current year.
+
+The alert notifier runs in the API process by default every five minutes. Set `BNASMGR_ALERT_NOTIFIER=off` to disable it or `BNASMGR_ALERT_NOTIFIER_SECONDS` to change the interval. Plain `http://` webhook URLs are POSTed directly, and email can be sent through a plain SMTP relay configured with host, port, sender, and recipient. `https://` webhooks and authenticated/TLS SMTP remain transport adapter work.
+
+Replication tasks are scanned by the API process by default every minute. Set `BNASMGR_REPLICATION_SCHEDULER=off` to disable it or `BNASMGR_REPLICATION_SCHEDULER_SECONDS` to change the interval.
 
 Destructive snapshot delete and rollback calls require an `X-BNASMGR-CONFIRM` header matching the exact snapshot name, in addition to UI confirmation.
 

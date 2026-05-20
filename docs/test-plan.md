@@ -6,6 +6,12 @@ Automated coverage in this MVP includes:
 - Helper-mediated Samba and NFS reload command construction.
 - FreeBSD `zpool`, `zfs snapshot`, and service-status output parsing.
 - Service allowlist enforcement and quota value validation.
+- SMART disk inventory, self-test launch validation, and self-test history parsing.
+- Computed alerts for failed helper operations and live NAS health signals.
+- Alert notification channel settings validation, persistence, and test audit events.
+- Background alert notification scan deduplication and delivery history.
+- Plain HTTP webhook delivery request construction.
+- Plain SMTP email message and command construction.
 - Helper operation history API and audit UI.
 - Samba storage user create/update/delete, password stdin handling, and helper-history redaction.
 - Samba server settings persistence and helper-applied global fragment rendering.
@@ -13,6 +19,8 @@ Automated coverage in this MVP includes:
 - Log service/severity/search/date-range filtering and FreeBSD syslog timestamp parsing.
 - Snapshot dataset/name validation and backend confirmation header enforcement for delete/rollback.
 - Snapshot file search and selected-file restore validation.
+- Replication task validation, persistence, listing, deletion, and manual run path.
+- Scheduled replication task cadence handling.
 - Argon2id password hashing with legacy development-hash verification.
 - Dashboard user create, role change, password reset, delete, self-delete guard, and last-admin guard.
 - Service status color mapping.
