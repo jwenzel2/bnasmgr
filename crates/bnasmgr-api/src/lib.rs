@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -20,13 +20,17 @@ use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Column, Row, SqlitePool};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_rustls::TlsConnector;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -316,7 +320,12 @@ impl AppState {
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    app_with_static_dir(state, None)
+}
+
+pub fn app_with_static_dir(state: AppState, static_dir: Option<PathBuf>) -> Router {
+    let mut router = Router::new()
+        .route("/api/*path", any(api_not_found))
         .route("/api/health", get(health))
         .route("/api/auth/login", post(login))
         .route("/api/auth/change-password", post(change_password))
@@ -412,7 +421,14 @@ pub fn app(state: AppState) -> Router {
             get(alert_notification_history),
         )
         .route("/api/audit", get(audit))
-        .route("/api/audit/helper-history", get(helper_history))
+        .route("/api/audit/helper-history", get(helper_history));
+
+    if let Some(static_dir) = static_dir {
+        let index = static_dir.join("index.html");
+        router = router.fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index)));
+    }
+
+    router
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -918,6 +934,10 @@ fn redacted_operation_json(operation: &HelperOperation) -> String {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn api_not_found() -> ApiError {
+    ApiError::not_found("api route not found")
 }
 
 #[derive(Deserialize)]
@@ -4211,7 +4231,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    async fn test_app() -> Router {
+    async fn test_state() -> AppState {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -4220,7 +4240,11 @@ mod tests {
         let state = AppState::new(pool, Arc::new(bnasmgr_helper::MockHelper));
         state.migrate().await.unwrap();
         state.seed_admin().await.unwrap();
-        app(state)
+        state
+    }
+
+    async fn test_app() -> Router {
+        app(test_state().await)
     }
 
     async fn login_admin(app: Router) -> (Router, String) {
@@ -4259,6 +4283,73 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         (app, token)
+    }
+
+    #[tokio::test]
+    async fn optional_static_dir_serves_spa_without_hijacking_api_404s() {
+        let static_dir = std::env::temp_dir().join(format!("bnasmgr-static-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(static_dir.join("assets")).unwrap();
+        std::fs::write(
+            static_dir.join("index.html"),
+            r#"<!doctype html><title>bnasmgr</title><div id="app">shell</div>"#,
+        )
+        .unwrap();
+        std::fs::write(static_dir.join("assets/app.css"), "body{color:#123}").unwrap();
+
+        let app = app_with_static_dir(test_state().await, Some(static_dir.clone()));
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("bnasmgr"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "body{color:#123}");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/storage")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("bnasmgr"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/not-a-real-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "api route not found");
+
+        std::fs::remove_dir_all(static_dir).unwrap();
     }
 
     #[tokio::test]

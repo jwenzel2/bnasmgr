@@ -46,6 +46,7 @@ cargo test --workspace
 cd frontend
 npm run check
 npm run build
+npm run test:e2e
 ```
 
 The latest local verification passed with these commands.
@@ -57,6 +58,4 @@ The latest local verification passed with these commands.
 - Wire and validate Samba include fragments on the exact Samba package version installed on the target host.
 - Wire and validate NFS export fragment consumption before relying on generated exports in production.
 - Validate file-level snapshot restore on FreeBSD with a disposable dataset, including datasets where `.zfs/snapshot` visibility differs from defaults.
-- Add automated browser smoke tests for login, first-password-change, storage load, snapshot workflow, service controls, logs, and user management.
-- Decide whether production should keep nginx serving the Svelte build or add static-file serving to `bnasmgr-api`.
 - Wire and validate iSCSI `ctl.conf` fragment inclusion before relying on dashboard-managed targets in production.

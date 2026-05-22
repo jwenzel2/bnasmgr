@@ -30,6 +30,7 @@ Automated coverage in this MVP includes:
 - Configuration backup import/export coverage with secret redaction.
 - Service status color mapping.
 - API first-login enforcement for privileged actions.
+- Browser smoke coverage for seeded-admin login, first-password-change, storage load, destructive dataset confirmation, snapshot file restore, snapshot task run, Samba/NFS/iSCSI share create/delete, alert webhook/email notification settings and tests, configuration export/import including replace restore, service restart, log filtering, dashboard user management, audit persistence, and core dashboard navigation.
 
 Manual smoke coverage:
 

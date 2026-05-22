@@ -25,6 +25,8 @@ BNASMGR_TLS_KEY=/usr/local/etc/ssl/bnasmgr/privkey.pem \
 cargo run -p bnasmgr-api
 ```
 
+The API can also serve the built frontend directly when `BNASMGR_STATIC_DIR` points at the Svelte build output directory containing `index.html`. Unknown non-API routes fall back to `index.html`; unknown `/api/*` routes still return JSON 404 responses.
+
 Run the frontend in another shell:
 
 ```sh

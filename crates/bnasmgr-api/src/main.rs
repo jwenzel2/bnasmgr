@@ -1,9 +1,9 @@
 use anyhow::Context;
 use axum_server::tls_rustls::RustlsConfig;
-use bnasmgr_api::{app, AppState};
+use bnasmgr_api::{app_with_static_dir, AppState};
 use bnasmgr_helper::{MockHelper, UnixSocketHelper};
 use sqlx::sqlite::SqlitePoolOptions;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -97,7 +97,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let addr: SocketAddr = bind.parse().context("parse BNASMGR_BIND")?;
-    let router = app(state);
+    let static_dir = std::env::var("BNASMGR_STATIC_DIR").ok().map(PathBuf::from);
+    if let Some(static_dir) = &static_dir {
+        tracing::info!(path = %static_dir.display(), "serving built frontend assets");
+    }
+    let router = app_with_static_dir(state, static_dir);
     match (
         std::env::var("BNASMGR_TLS_CERT"),
         std::env::var("BNASMGR_TLS_KEY"),

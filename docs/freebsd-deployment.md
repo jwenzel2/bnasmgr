@@ -143,7 +143,18 @@ BNASMGR_TLS_KEY=/usr/local/etc/ssl/bnasmgr/privkey.pem \
 /usr/local/sbin/bnasmgr-api
 ```
 
-If using direct TLS, either serve the frontend through a separate HTTPS static file server or embed a production static-file layer in a later build. The current recommended production deployment remains nginx serving the frontend and proxying `/api/`.
+If using direct TLS, either serve the frontend through a separate HTTPS static file server or set `BNASMGR_STATIC_DIR` so `bnasmgr-api` serves the built frontend itself. The recommended production layout remains nginx serving the frontend and proxying `/api/`, but direct static serving is available for simpler deployments.
+
+To serve the built Svelte frontend directly from `bnasmgr-api`, set `BNASMGR_STATIC_DIR` to the directory containing `index.html`. Unknown non-API routes fall back to `index.html` for client-side routing, while unknown `/api/*` routes still return JSON 404 responses:
+
+```sh
+BNASMGR_DATABASE_URL='sqlite:///usr/local/etc/bnasmgr/bnasmgr.db?mode=rwc' \
+BNASMGR_BIND=0.0.0.0:8443 \
+BNASMGR_TLS_CERT=/usr/local/etc/ssl/bnasmgr/fullchain.pem \
+BNASMGR_TLS_KEY=/usr/local/etc/ssl/bnasmgr/privkey.pem \
+BNASMGR_STATIC_DIR=/usr/local/www/bnasmgr \
+/usr/local/sbin/bnasmgr-api
+```
 
 ### rc.d HTTPS Environment
 
