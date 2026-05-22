@@ -27,13 +27,13 @@ sysrc rpcbind_enable=YES
 sysrc syslogd_enable=YES
 ```
 
-iSCSI status monitoring is scaffolded through the `ctld` service card:
+iSCSI target management uses the `ctld` service:
 
 ```sh
 sysrc ctld_enable=YES
 ```
 
-Full iSCSI target CRUD is deferred beyond the MVP. Keep target and extent definitions managed through `/etc/ctl.conf` until that work lands.
+Dashboard-managed iSCSI targets are written as helper-owned fragments under `/usr/local/etc/bnasmgr/ctl.conf.d` by default. Include those fragments from `/etc/ctl.conf` using the target host's supported include mechanism before relying on dashboard-managed targets.
 
 ## Build and Install
 
@@ -192,11 +192,13 @@ Snapshot delete and rollback also require `X-BNASMGR-CONFIRM` to exactly match t
 
 File-level snapshot restore uses the dataset snapshot mount at `<mountpoint>/.zfs/snapshot/<snapshot-name>` and copies selected relative file paths back into the live dataset. It does not roll back the entire dataset. Restore requests still require `X-BNASMGR-CONFIRM` because existing live files can be overwritten.
 
-Dashboard users are separate from FreeBSD users and Samba users. Use dashboard users only for web access; use Samba/system tooling for storage identities until deeper identity reconciliation is implemented.
+Dashboard users are separate from FreeBSD users and Samba users. Use dashboard users only for web access; use the local identity and Samba user panels for storage identities.
 
 Dashboard admins can create users, promote/demote roles, reset temporary passwords, and delete other dashboard users. The API prevents deleting your own account and prevents deleting or demoting the last remaining dashboard admin.
 
-Samba users are storage identities, not dashboard identities. The dashboard can set or rotate a Samba password through `smbpasswd -a -s`, enable/disable the user, and delete the Samba account through `pdbedit -x -u`. Passwords are provided to `smbpasswd` through stdin and are redacted from helper history before the operation is persisted.
+Local Unix users and groups are managed through `pw` helper operations. Samba users are storage identities, not dashboard identities. The dashboard can set or rotate a Samba password through `smbpasswd -a -s`, enable/disable the user, and delete the Samba account through `pdbedit -x -u`. Passwords are provided through stdin and are redacted from helper history before the operation is persisted.
+
+Configuration backup/export covers saved dashboard operational state only. It excludes sessions, audit/helper history, notification delivery attempts, and dashboard password hashes. SMTP passwords are redacted from exported alert notification settings and must be re-entered after restore if email delivery uses authentication.
 
 The audit screen shows both high-level audit events and raw helper operation history, which is useful for reviewing privileged operations and failed helper requests.
 

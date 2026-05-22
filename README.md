@@ -49,14 +49,18 @@ Default dashboard credentials are `admin` / `admin`. The first login is intentio
 All routes are under `/api`:
 
 - `/api/auth/*`
+- `/api/config/export` and `/api/config/import` for operational configuration backup and restore
 - `/api/users` for listing, creating, deleting, role changes, and password resets
-- `/api/storage/*`
+- `/api/system/users` and `/api/system/groups` for local Unix identity management
+- `/api/storage/*` including dataset create, property updates, delete, quota, and pool scrub controls
 - `/api/storage/disks/tests` for SMART self-test launch and history
 - `/api/snapshots/*`
 - `/api/snapshots/:snapshot/files` for searching snapshot contents and restoring selected files
+- `/api/snapshots/:snapshot/clone` and `/api/snapshots/:snapshot/diff` for point-in-time clone and change inspection workflows
 - `/api/replication/tasks` for local and remote ZFS replication task definitions and manual runs
 - `/api/shares/samba/*` including server settings, shares, and Samba users
 - `/api/shares/nfs/*`
+- `/api/shares/iscsi/*` for iSCSI target, extent, and LUN definitions
 - `/api/services/*`
 - `/api/alerts` for computed storage, disk, service, and helper-failure alerts
 - `/api/alerts/notifications` for alert notification channel settings
@@ -68,23 +72,29 @@ The privileged boundary is represented by `bnasmgr-helper`. It accepts typed ope
 
 The FreeBSD helper adapter now normalizes `zpool`, `zfs`, `service`, and log output into the same JSON shape used by mock development mode, so the UI can switch adapters without changing API contracts.
 
-Service control is restricted to the NAS service allowlist, and quota updates are validated before reaching the helper.
+Service control is restricted to the NAS service allowlist. Dataset create/update/delete and quota changes are validated before reaching the helper; destructive dataset delete requires an `X-BNASMGR-CONFIRM` header matching the dataset name.
 
-Samba storage users are managed separately from dashboard users. Samba passwords are sent to the helper over the local socket and are redacted from helper history.
+Local Unix users/groups and Samba storage users are managed separately from dashboard users. Local and Samba passwords are sent to the helper over the local socket and are redacted from helper history.
 
 Dashboard admins can manage common Samba server settings such as workgroup, server string, NetBIOS name, security mode, guest mapping, and log level. The helper writes these as a Samba global fragment before reloading `samba_server`.
 
 Samba and NFS share application writes helper-owned config fragments atomically before service reload. The default FreeBSD fragment roots are `/usr/local/etc/bnasmgr/smb4.includes` and `/usr/local/etc/bnasmgr/exports.d`.
 
+iSCSI target application writes helper-owned `ctl.conf` fragments before reloading `ctld`. The default FreeBSD fragment root is `/usr/local/etc/bnasmgr/ctl.conf.d`; include those fragments from the host `ctl.conf` before relying on dashboard-managed targets.
+
 The log viewer supports service, severity, search text, and date-range filters. FreeBSD syslog-style timestamps are parsed using the current year.
 
-The alert notifier runs in the API process by default every five minutes. Set `BNASMGR_ALERT_NOTIFIER=off` to disable it or `BNASMGR_ALERT_NOTIFIER_SECONDS` to change the interval. Plain `http://` webhook URLs are POSTed directly, and email can be sent through a plain SMTP relay configured with host, port, sender, and recipient. `https://` webhooks and authenticated/TLS SMTP remain transport adapter work.
+The alert notifier runs in the API process by default every five minutes. Set `BNASMGR_ALERT_NOTIFIER=off` to disable it or `BNASMGR_ALERT_NOTIFIER_SECONDS` to change the interval. `http://` and `https://` webhook URLs are POSTed directly, and email can be sent through SMTP with plain, STARTTLS, or implicit TLS transport. SMTP authentication uses AUTH PLAIN when a username and password are configured.
 
-Replication tasks are scanned by the API process by default every minute. Set `BNASMGR_REPLICATION_SCHEDULER=off` to disable it or `BNASMGR_REPLICATION_SCHEDULER_SECONDS` to change the interval.
+Replication tasks are scanned by the API process by default every minute. Set `BNASMGR_REPLICATION_SCHEDULER=off` to disable it or `BNASMGR_REPLICATION_SCHEDULER_SECONDS` to change the interval. Each run creates a `repl-*` snapshot, uses the newest prior local `repl-*` snapshot as the incremental send base when one exists, and prunes older local replication snapshots by the task retention count.
 
 Destructive snapshot delete and rollback calls require an `X-BNASMGR-CONFIRM` header matching the exact snapshot name, in addition to UI confirmation.
 
 File-level snapshot restore searches files under the dataset snapshot mount and restores selected relative paths back into the live dataset. Restore requests also require `X-BNASMGR-CONFIRM` matching the snapshot name because existing live files may be overwritten.
+
+Snapshot clone creates a writable ZFS dataset from a selected snapshot. Snapshot diff uses `zfs diff -FHt` and returns normalized change rows for inspection before restore or rollback.
+
+Configuration export/import covers saved operational dashboard state such as shares, iSCSI targets, Samba users, notification settings, and scheduled tasks. Sessions, audit/helper history, notification delivery history, and password hashes are intentionally excluded; SMTP passwords are redacted from exports.
 
 ## Project Layout
 

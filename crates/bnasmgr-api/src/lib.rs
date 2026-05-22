@@ -9,20 +9,23 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bnasmgr_helper::{
-    allowed_service, valid_quota, HelperClient, HelperOperation, HelperRequest, PoolScrubAction,
-    ServiceAction,
+    allowed_service, valid_dataset_compression, valid_dataset_mountpoint, valid_dataset_on_off,
+    valid_quota, HelperClient, HelperOperation, HelperRequest, PoolScrubAction, ServiceAction,
 };
 use chrono::{DateTime, Utc};
 use rand_core::OsRng;
+use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Column, Row, SqlitePool};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
+use tokio_rustls::TlsConnector;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
 
@@ -72,6 +75,19 @@ impl AppState {
                 path text not null,
                 clients text not null,
                 options text not null,
+                created_at text not null
+            )",
+            "create table if not exists iscsi_targets (
+                id text primary key,
+                name text not null unique,
+                portal_group text not null,
+                initiator_name text,
+                auth_group text not null,
+                extent_name text not null,
+                path text not null,
+                size text,
+                lun_id integer not null,
+                readonly integer not null,
                 created_at text not null
             )",
             "create table if not exists audit_events (
@@ -124,6 +140,7 @@ impl AppState {
                 remote_host text,
                 remote_user text,
                 cadence text not null,
+                retention_count integer not null default 14,
                 enabled integer not null,
                 created_at text not null,
                 updated_at text not null,
@@ -136,6 +153,12 @@ impl AppState {
             .await?;
         self.ensure_column("replication_tasks", "last_run_at", "text")
             .await?;
+        self.ensure_column(
+            "replication_tasks",
+            "retention_count",
+            "integer not null default 14",
+        )
+        .await?;
         sqlx::query("create unique index if not exists idx_alert_notification_history_alert_channel on alert_notification_history(alert_key, channel)")
             .execute(&self.db)
             .await?;
@@ -260,7 +283,7 @@ impl AppState {
     }
 
     pub async fn run_due_replication_tasks(&self) -> Result<usize, ApiError> {
-        let rows = sqlx::query("select id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, enabled, created_at, updated_at, last_run_at from replication_tasks where enabled = 1 order by source_dataset, destination_dataset")
+        let rows = sqlx::query("select id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, retention_count, enabled, created_at, updated_at, last_run_at from replication_tasks where enabled = 1 order by source_dataset, destination_dataset")
             .fetch_all(&self.db)
             .await?;
         let now = Utc::now();
@@ -298,11 +321,26 @@ pub fn app(state: AppState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/change-password", post(change_password))
         .route("/api/auth/me", get(me))
+        .route("/api/config/export", get(export_config))
+        .route("/api/config/import", post(import_config))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/:id", delete(delete_user))
         .route("/api/users/:id/role", post(update_user_role))
         .route("/api/users/:id/reset-password", post(reset_user_password))
+        .route(
+            "/api/system/users",
+            get(list_local_users).post(upsert_local_user),
+        )
+        .route("/api/system/users/:username", delete(delete_local_user))
+        .route(
+            "/api/system/groups",
+            get(list_local_groups).post(upsert_local_group),
+        )
+        .route("/api/system/groups/:name", delete(delete_local_group))
         .route("/api/storage/overview", get(storage_overview))
+        .route("/api/storage/datasets", post(create_dataset))
+        .route("/api/storage/datasets/properties", post(update_dataset))
+        .route("/api/storage/datasets/delete", post(delete_dataset))
         .route("/api/storage/disks", get(disk_health))
         .route(
             "/api/storage/disks/tests",
@@ -335,6 +373,8 @@ pub fn app(state: AppState) -> Router {
             "/api/snapshots/:snapshot/files/restore",
             post(restore_snapshot_files),
         )
+        .route("/api/snapshots/:snapshot/clone", post(clone_snapshot))
+        .route("/api/snapshots/:snapshot/diff", get(diff_snapshot))
         .route("/api/snapshots/:snapshot", delete(delete_snapshot))
         .route("/api/snapshots/:snapshot/rollback", post(rollback_snapshot))
         .route(
@@ -353,6 +393,8 @@ pub fn app(state: AppState) -> Router {
         .route("/api/shares/samba/:id", delete(delete_samba))
         .route("/api/shares/nfs", get(list_nfs).post(upsert_nfs))
         .route("/api/shares/nfs/:id", delete(delete_nfs))
+        .route("/api/shares/iscsi", get(list_iscsi).post(upsert_iscsi))
+        .route("/api/shares/iscsi/:id", delete(delete_iscsi))
         .route("/api/services", get(list_services))
         .route("/api/services/:service/:action", post(service_action))
         .route("/api/logs", get(logs))
@@ -545,6 +587,26 @@ fn validate_share_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_iscsi_name(value: &str, field: &str) -> Result<(), ApiError> {
+    reject_shell_chars(value, field)?;
+    if value.is_empty()
+        || value.len() > 255
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '_' | '-'))
+    {
+        return Err(ApiError::bad_request(format!("{field} is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_optional_iscsi_name(value: Option<&str>, field: &str) -> Result<(), ApiError> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        validate_iscsi_name(value, field)?;
+    }
+    Ok(())
+}
+
 fn validate_absolute_path(path: &str) -> Result<(), ApiError> {
     reject_shell_chars(path, "path")?;
     if !path.starts_with('/') || path.contains("/../") || path.ends_with("/..") {
@@ -686,6 +748,63 @@ fn validate_quota_value(quota: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_optional_quota_value(value: Option<&str>, field: &str) -> Result<(), ApiError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    reject_shell_chars(value, field)?;
+    if !valid_quota(value) {
+        return Err(ApiError::bad_request(format!("{field} value is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_optional_compression(value: Option<&str>) -> Result<(), ApiError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    reject_shell_chars(value, "compression")?;
+    if !valid_dataset_compression(value) {
+        return Err(ApiError::bad_request("compression value is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_optional_atime(value: Option<&str>) -> Result<(), ApiError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    reject_shell_chars(value, "atime")?;
+    if !valid_dataset_on_off(value) {
+        return Err(ApiError::bad_request("atime must be on or off"));
+    }
+    Ok(())
+}
+
+fn validate_optional_mountpoint(value: Option<&str>) -> Result<(), ApiError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    reject_shell_chars(value, "mountpoint")?;
+    if !valid_dataset_mountpoint(value) {
+        return Err(ApiError::bad_request(
+            "mountpoint must be none, legacy, or an absolute path without traversal",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_optional_property(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
 fn validate_user_list(users: &[String]) -> Result<(), ApiError> {
     for username in users {
         reject_shell_chars(username, "allowed user")?;
@@ -710,6 +829,18 @@ fn validate_storage_username(username: &str) -> Result<(), ApiError> {
         return Err(ApiError::bad_request(
             "username may only contain letters, numbers, dots, dashes, and underscores",
         ));
+    }
+    Ok(())
+}
+
+fn validate_local_group_name(name: &str) -> Result<(), ApiError> {
+    validate_storage_username(name)
+}
+
+fn validate_shell(shell: &str) -> Result<(), ApiError> {
+    reject_shell_chars(shell, "shell")?;
+    if !shell.starts_with('/') || shell.contains("..") {
+        return Err(ApiError::bad_request("shell must be an absolute path"));
     }
     Ok(())
 }
@@ -759,6 +890,25 @@ fn redacted_operation_json(operation: &HelperOperation) -> String {
                 "username": username,
                 "password": "<redacted>",
                 "enabled": enabled,
+            }
+        }),
+        HelperOperation::UpsertLocalUser {
+            username,
+            full_name,
+            shell,
+            home,
+            groups,
+            password,
+            create_home,
+        } => serde_json::json!({
+            "upsert_local_user": {
+                "username": username,
+                "full_name": full_name,
+                "shell": shell,
+                "home": home,
+                "groups": groups,
+                "password": password.as_ref().map(|_| "<redacted>"),
+                "create_home": create_home,
             }
         }),
         _ => serde_json::to_value(operation).unwrap_or_else(|_| serde_json::json!({})),
@@ -911,6 +1061,12 @@ struct AlertNotificationSettings {
     smtp_port: u16,
     #[serde(default)]
     smtp_from: String,
+    #[serde(default = "default_smtp_tls")]
+    smtp_tls: String,
+    #[serde(default)]
+    smtp_username: String,
+    #[serde(default)]
+    smtp_password: String,
 }
 
 #[derive(Serialize)]
@@ -933,6 +1089,9 @@ impl Default for AlertNotificationSettings {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_from: String::new(),
+            smtp_tls: default_smtp_tls(),
+            smtp_username: String::new(),
+            smtp_password: String::new(),
         }
     }
 }
@@ -943,6 +1102,10 @@ fn default_alert_min_severity() -> String {
 
 fn default_smtp_port() -> u16 {
     25
+}
+
+fn default_smtp_tls() -> String {
+    "none".into()
 }
 
 async fn count_admins(state: &AppState) -> Result<i64, ApiError> {
@@ -1177,6 +1340,393 @@ async fn delete_user(
     ))
 }
 
+async fn query_json_rows(state: &AppState, sql: &str) -> Result<Vec<serde_json::Value>, ApiError> {
+    Ok(sqlx::query(sql)
+        .fetch_all(&state.db)
+        .await?
+        .into_iter()
+        .map(row_to_json)
+        .collect())
+}
+
+fn redacted_setting_row(mut row: serde_json::Value) -> serde_json::Value {
+    if row.get("key").and_then(|value| value.as_str()) == Some("alert_notifications") {
+        if let Some(value) = row.get("value").and_then(|value| value.as_str()) {
+            if let Ok(mut settings) = serde_json::from_str::<AlertNotificationSettings>(value) {
+                settings.smtp_password.clear();
+                if let Ok(redacted) = serde_json::to_string(&settings) {
+                    row["value"] = serde_json::Value::String(redacted);
+                }
+            }
+        }
+    }
+    row
+}
+
+async fn export_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    let settings = query_json_rows(&state, "select key, value from app_settings order by key")
+        .await?
+        .into_iter()
+        .map(redacted_setting_row)
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "version": 1,
+        "exported_at": Utc::now().to_rfc3339(),
+        "app_settings": settings,
+        "shares_samba": query_json_rows(&state, "select id, name, path, allowed_users, readonly, created_at from shares_samba order by name").await?,
+        "samba_users": query_json_rows(&state, "select username, enabled, created_at, updated_at from samba_users order by username").await?,
+        "shares_nfs": query_json_rows(&state, "select id, path, clients, options, created_at from shares_nfs order by path").await?,
+        "iscsi_targets": query_json_rows(&state, "select id, name, portal_group, initiator_name, auth_group, extent_name, path, size, lun_id, readonly, created_at from iscsi_targets order by name").await?,
+        "snapshot_tasks": query_json_rows(&state, "select id, dataset, prefix, cadence, retention_count, enabled, created_at, updated_at, last_run_at from snapshot_tasks order by dataset, prefix").await?,
+        "replication_tasks": query_json_rows(&state, "select id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, retention_count, enabled, created_at, updated_at, last_run_at from replication_tasks order by source_dataset, destination_dataset").await?,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ConfigImportRequest {
+    backup: serde_json::Value,
+    #[serde(default)]
+    replace: bool,
+}
+
+fn backup_rows<'a>(
+    backup: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a Vec<serde_json::Value>, ApiError> {
+    backup
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| ApiError::bad_request(format!("backup is missing {key} rows")))
+}
+
+async fn upsert_backup_rows(
+    state: &AppState,
+    table: &str,
+    columns: &[&str],
+    conflict: &[&str],
+    rows: &[serde_json::Value],
+) -> Result<(), ApiError> {
+    let placeholders = vec!["?"; columns.len()].join(", ");
+    let updates = columns
+        .iter()
+        .filter(|column| !conflict.contains(column))
+        .map(|column| format!("{column} = excluded.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "insert into {table} ({}) values ({placeholders}) on conflict({}) do update set {updates}",
+        columns.join(", "),
+        conflict.join(", ")
+    );
+    for row in rows {
+        let mut query = sqlx::query(&sql);
+        for column in columns {
+            let value = row.get(*column).unwrap_or(&serde_json::Value::Null);
+            query = match value {
+                serde_json::Value::Null => query.bind(Option::<String>::None),
+                serde_json::Value::Bool(value) => query.bind(if *value { 1_i64 } else { 0_i64 }),
+                serde_json::Value::Number(value) => query.bind(value.as_i64().unwrap_or_default()),
+                serde_json::Value::String(value) => query.bind(value),
+                other => query.bind(other.to_string()),
+            };
+        }
+        query.execute(&state.db).await?;
+    }
+    Ok(())
+}
+
+async fn import_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ConfigImportRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    if body.backup.get("version").and_then(|value| value.as_i64()) != Some(1) {
+        return Err(ApiError::bad_request("unsupported config backup version"));
+    }
+    if body.replace {
+        for table in [
+            "app_settings",
+            "shares_samba",
+            "samba_users",
+            "shares_nfs",
+            "iscsi_targets",
+            "snapshot_tasks",
+            "replication_tasks",
+        ] {
+            sqlx::query(&format!("delete from {table}"))
+                .execute(&state.db)
+                .await?;
+        }
+    }
+    upsert_backup_rows(
+        &state,
+        "app_settings",
+        &["key", "value"],
+        &["key"],
+        backup_rows(&body.backup, "app_settings")?,
+    )
+    .await?;
+    upsert_backup_rows(
+        &state,
+        "shares_samba",
+        &[
+            "id",
+            "name",
+            "path",
+            "allowed_users",
+            "readonly",
+            "created_at",
+        ],
+        &["id"],
+        backup_rows(&body.backup, "shares_samba")?,
+    )
+    .await?;
+    upsert_backup_rows(
+        &state,
+        "samba_users",
+        &["username", "enabled", "created_at", "updated_at"],
+        &["username"],
+        backup_rows(&body.backup, "samba_users")?,
+    )
+    .await?;
+    upsert_backup_rows(
+        &state,
+        "shares_nfs",
+        &["id", "path", "clients", "options", "created_at"],
+        &["id"],
+        backup_rows(&body.backup, "shares_nfs")?,
+    )
+    .await?;
+    upsert_backup_rows(
+        &state,
+        "iscsi_targets",
+        &[
+            "id",
+            "name",
+            "portal_group",
+            "initiator_name",
+            "auth_group",
+            "extent_name",
+            "path",
+            "size",
+            "lun_id",
+            "readonly",
+            "created_at",
+        ],
+        &["id"],
+        backup_rows(&body.backup, "iscsi_targets")?,
+    )
+    .await?;
+    upsert_backup_rows(
+        &state,
+        "snapshot_tasks",
+        &[
+            "id",
+            "dataset",
+            "prefix",
+            "cadence",
+            "retention_count",
+            "enabled",
+            "created_at",
+            "updated_at",
+            "last_run_at",
+        ],
+        &["id"],
+        backup_rows(&body.backup, "snapshot_tasks")?,
+    )
+    .await?;
+    upsert_backup_rows(
+        &state,
+        "replication_tasks",
+        &[
+            "id",
+            "source_dataset",
+            "destination_dataset",
+            "mode",
+            "remote_host",
+            "remote_user",
+            "cadence",
+            "retention_count",
+            "enabled",
+            "created_at",
+            "updated_at",
+            "last_run_at",
+        ],
+        &["id"],
+        backup_rows(&body.backup, "replication_tasks")?,
+    )
+    .await?;
+    state
+        .audit(
+            &user.username,
+            "config",
+            "import",
+            "ok",
+            "configuration backup imported",
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "imported": true })))
+}
+
+#[derive(Deserialize)]
+struct LocalUserRequest {
+    username: String,
+    full_name: Option<String>,
+    shell: String,
+    home: Option<String>,
+    groups: Vec<String>,
+    password: Option<String>,
+    create_home: bool,
+}
+
+#[derive(Deserialize)]
+struct DeleteLocalUserQuery {
+    remove_home: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct LocalGroupRequest {
+    name: String,
+    members: Vec<String>,
+}
+
+async fn list_local_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::ListLocalUsers)
+            .await?,
+    ))
+}
+
+async fn upsert_local_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LocalUserRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_storage_username(&body.username)?;
+    validate_shell(&body.shell)?;
+    if let Some(full_name) = &body.full_name {
+        reject_shell_chars(full_name, "full name")?;
+    }
+    if let Some(home) = &body.home {
+        validate_absolute_path(home)?;
+    }
+    for group in &body.groups {
+        validate_local_group_name(group)?;
+    }
+    if let Some(password) = &body.password {
+        if password.len() < 8 {
+            return Err(ApiError::bad_request(
+                "local user password must be at least 8 characters",
+            ));
+        }
+    }
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::UpsertLocalUser {
+                    username: body.username,
+                    full_name: normalize_optional_property(body.full_name),
+                    shell: body.shell,
+                    home: normalize_optional_property(body.home),
+                    groups: body.groups,
+                    password: body.password,
+                    create_home: body.create_home,
+                },
+            )
+            .await?,
+    ))
+}
+
+async fn delete_local_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+    Query(query): Query<DeleteLocalUserQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_storage_username(&username)?;
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::DeleteLocalUser {
+                    username,
+                    remove_home: query.remove_home.unwrap_or(false),
+                },
+            )
+            .await?,
+    ))
+}
+
+async fn list_local_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::ListLocalGroups)
+            .await?,
+    ))
+}
+
+async fn upsert_local_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LocalGroupRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_local_group_name(&body.name)?;
+    for member in &body.members {
+        validate_storage_username(member)?;
+    }
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::UpsertLocalGroup {
+                    name: body.name,
+                    members: body.members,
+                },
+            )
+            .await?,
+    ))
+}
+
+async fn delete_local_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_local_group_name(&name)?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::DeleteLocalGroup { name })
+            .await?,
+    ))
+}
+
 async fn storage_overview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1186,6 +1736,112 @@ async fn storage_overview(
         .helper(&user.username, HelperOperation::ListStorage)
         .await?;
     Ok(Json(data))
+}
+
+#[derive(Deserialize)]
+struct DatasetMutationRequest {
+    name: String,
+    compression: Option<String>,
+    atime: Option<String>,
+    quota: Option<String>,
+    reservation: Option<String>,
+    mountpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeleteDatasetRequest {
+    name: String,
+}
+
+fn validate_dataset_mutation(body: &DatasetMutationRequest) -> Result<(), ApiError> {
+    validate_dataset_name(&body.name)?;
+    validate_optional_compression(body.compression.as_deref())?;
+    validate_optional_atime(body.atime.as_deref())?;
+    validate_optional_quota_value(body.quota.as_deref(), "quota")?;
+    validate_optional_quota_value(body.reservation.as_deref(), "reservation")?;
+    validate_optional_mountpoint(body.mountpoint.as_deref())?;
+    Ok(())
+}
+
+fn require_dataset_confirmation(headers: &HeaderMap, dataset: &str) -> Result<(), ApiError> {
+    let confirmed = headers
+        .get("x-bnasmgr-confirm")
+        .and_then(|value| value.to_str().ok());
+    if confirmed != Some(dataset) {
+        return Err(ApiError::bad_request(
+            "destructive dataset operation requires x-bnasmgr-confirm header matching the dataset name",
+        ));
+    }
+    Ok(())
+}
+
+async fn create_dataset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DatasetMutationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_dataset_mutation(&body)?;
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::CreateDataset {
+                    name: body.name,
+                    compression: normalize_optional_property(body.compression),
+                    atime: normalize_optional_property(body.atime),
+                    quota: normalize_optional_property(body.quota),
+                    reservation: normalize_optional_property(body.reservation),
+                    mountpoint: normalize_optional_property(body.mountpoint),
+                },
+            )
+            .await?,
+    ))
+}
+
+async fn update_dataset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DatasetMutationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_dataset_mutation(&body)?;
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::UpdateDataset {
+                    name: body.name,
+                    compression: normalize_optional_property(body.compression),
+                    atime: normalize_optional_property(body.atime),
+                    quota: normalize_optional_property(body.quota),
+                    reservation: normalize_optional_property(body.reservation),
+                    mountpoint: normalize_optional_property(body.mountpoint),
+                },
+            )
+            .await?,
+    ))
+}
+
+async fn delete_dataset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteDatasetRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_dataset_name(&body.name)?;
+    require_dataset_confirmation(&headers, &body.name)?;
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::DeleteDataset { name: body.name },
+            )
+            .await?,
+    ))
 }
 
 async fn disk_health(
@@ -1559,6 +2215,7 @@ struct ReplicationTask {
     remote_host: Option<String>,
     remote_user: Option<String>,
     cadence: String,
+    retention_count: i64,
     enabled: bool,
     created_at: String,
     updated_at: String,
@@ -1573,7 +2230,13 @@ struct CreateReplicationTaskRequest {
     remote_host: Option<String>,
     remote_user: Option<String>,
     cadence: String,
+    #[serde(default = "default_replication_retention_count")]
+    retention_count: i64,
     enabled: bool,
+}
+
+fn default_replication_retention_count() -> i64 {
+    14
 }
 
 fn row_to_replication_task(row: sqlx::sqlite::SqliteRow) -> ReplicationTask {
@@ -1585,6 +2248,7 @@ fn row_to_replication_task(row: sqlx::sqlite::SqliteRow) -> ReplicationTask {
         remote_host: row.get("remote_host"),
         remote_user: row.get("remote_user"),
         cadence: row.get("cadence"),
+        retention_count: row.get("retention_count"),
         enabled: row.get::<i64, _>("enabled") == 1,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -1597,6 +2261,11 @@ fn validate_replication_task(body: &CreateReplicationTaskRequest) -> Result<(), 
     validate_dataset_name(&body.destination_dataset)?;
     validate_replication_mode(&body.mode)?;
     validate_snapshot_cadence(&body.cadence)?;
+    if !(1..=10_000).contains(&body.retention_count) {
+        return Err(ApiError::bad_request(
+            "replication retention count must be between 1 and 10000",
+        ));
+    }
     if body.source_dataset == body.destination_dataset {
         return Err(ApiError::bad_request(
             "replication source and destination must differ",
@@ -1629,7 +2298,7 @@ async fn list_replication_tasks(
 ) -> Result<Json<Vec<ReplicationTask>>, ApiError> {
     let user = auth(&headers, &state).await?;
     require_admin(&user)?;
-    let rows = sqlx::query("select id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, enabled, created_at, updated_at, last_run_at from replication_tasks order by source_dataset, destination_dataset")
+    let rows = sqlx::query("select id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, retention_count, enabled, created_at, updated_at, last_run_at from replication_tasks order by source_dataset, destination_dataset")
         .fetch_all(&state.db)
         .await?;
     Ok(Json(
@@ -1656,12 +2325,13 @@ async fn create_replication_task(
         remote_host,
         remote_user,
         cadence: body.cadence,
+        retention_count: body.retention_count,
         enabled: body.enabled,
         created_at: now.clone(),
         updated_at: now,
         last_run_at: None,
     };
-    sqlx::query("insert into replication_tasks (id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, enabled, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("insert into replication_tasks (id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, retention_count, enabled, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&task.id)
         .bind(&task.source_dataset)
         .bind(&task.destination_dataset)
@@ -1669,6 +2339,7 @@ async fn create_replication_task(
         .bind(&task.remote_host)
         .bind(&task.remote_user)
         .bind(&task.cadence)
+        .bind(task.retention_count)
         .bind(if task.enabled { 1 } else { 0 })
         .bind(&task.created_at)
         .bind(&task.updated_at)
@@ -1719,7 +2390,7 @@ async fn run_replication_task(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = auth(&headers, &state).await?;
     require_privileged(&user)?;
-    let row = sqlx::query("select id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, enabled, created_at, updated_at, last_run_at from replication_tasks where id = ?")
+    let row = sqlx::query("select id, source_dataset, destination_dataset, mode, remote_host, remote_user, cadence, retention_count, enabled, created_at, updated_at, last_run_at from replication_tasks where id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?
@@ -1737,6 +2408,7 @@ async fn execute_replication_task(
     actor: &str,
     task: &ReplicationTask,
 ) -> Result<serde_json::Value, ApiError> {
+    let base_snapshot = latest_replication_snapshot(state, actor, &task.source_dataset).await?;
     let label = format!("repl-{}", Utc::now().format("%Y%m%d-%H%M%S"));
     validate_snapshot_label(&label)?;
     let snapshot = format!("{}@{}", task.source_dataset, label);
@@ -1754,12 +2426,15 @@ async fn execute_replication_task(
             actor,
             HelperOperation::RunReplication {
                 snapshot: snapshot.clone(),
+                base_snapshot: base_snapshot.clone(),
                 destination_dataset: task.destination_dataset.clone(),
                 remote_host: task.remote_host.clone(),
                 remote_user: task.remote_user.clone(),
             },
         )
         .await?;
+    let retention_deleted =
+        enforce_replication_task_retention(state, actor, task, &snapshot).await?;
     sqlx::query("update replication_tasks set last_run_at = ?, updated_at = ? where id = ?")
         .bind(Utc::now().to_rfc3339())
         .bind(Utc::now().to_rfc3339())
@@ -1768,9 +2443,112 @@ async fn execute_replication_task(
         .await?;
     Ok(serde_json::json!({
         "snapshot": snapshot,
+        "base_snapshot": base_snapshot,
         "created": created,
         "replicated": replicated,
+        "retention_deleted": retention_deleted,
     }))
+}
+
+async fn latest_replication_snapshot(
+    state: &AppState,
+    actor: &str,
+    source_dataset: &str,
+) -> Result<Option<String>, ApiError> {
+    let snapshots = state
+        .helper(
+            actor,
+            HelperOperation::ListSnapshots {
+                dataset: Some(source_dataset.to_string()),
+            },
+        )
+        .await?;
+    Ok(replication_snapshot_candidates(&snapshots, source_dataset)
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.name))
+}
+
+async fn enforce_replication_task_retention(
+    state: &AppState,
+    actor: &str,
+    task: &ReplicationTask,
+    created_snapshot: &str,
+) -> Result<Vec<String>, ApiError> {
+    let snapshots = state
+        .helper(
+            actor,
+            HelperOperation::ListSnapshots {
+                dataset: Some(task.source_dataset.clone()),
+            },
+        )
+        .await?;
+    let mut candidates = replication_snapshot_candidates(&snapshots, &task.source_dataset);
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.name == created_snapshot)
+    {
+        candidates.push(SnapshotRetentionCandidate {
+            name: created_snapshot.to_string(),
+            created_at: Utc::now(),
+        });
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.name.cmp(&left.name))
+    });
+
+    let keep = task.retention_count.max(1) as usize;
+    let mut deleted = Vec::new();
+    for candidate in candidates.into_iter().skip(keep) {
+        state
+            .helper(
+                actor,
+                HelperOperation::DeleteSnapshot {
+                    snapshot: candidate.name.clone(),
+                },
+            )
+            .await?;
+        deleted.push(candidate.name);
+    }
+    Ok(deleted)
+}
+
+fn replication_snapshot_candidates(
+    snapshots: &serde_json::Value,
+    source_dataset: &str,
+) -> Vec<SnapshotRetentionCandidate> {
+    let prefix = format!("{source_dataset}@repl-");
+    let mut candidates = snapshots
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|snapshot| {
+            let name = snapshot.get("name")?.as_str()?;
+            if !name.starts_with(&prefix) {
+                return None;
+            }
+            let created_at = snapshot
+                .get("created_at")
+                .and_then(|value| value.as_str())
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            Some(SnapshotRetentionCandidate {
+                name: name.to_string(),
+                created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.name.cmp(&left.name))
+    });
+    candidates
 }
 
 async fn run_snapshot_task(
@@ -1923,6 +2701,64 @@ async fn rollback_snapshot(
             .helper(
                 &user.username,
                 HelperOperation::RollbackSnapshot { snapshot },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct CloneSnapshotRequest {
+    target_dataset: String,
+}
+
+async fn clone_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(snapshot): Path<String>,
+    Json(body): Json<CloneSnapshotRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_snapshot_name(&snapshot)?;
+    validate_dataset_name(&body.target_dataset)?;
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::CloneSnapshot {
+                    snapshot,
+                    target_dataset: body.target_dataset,
+                },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct SnapshotDiffQuery {
+    to_snapshot: Option<String>,
+}
+
+async fn diff_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(snapshot): Path<String>,
+    Query(query): Query<SnapshotDiffQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    validate_snapshot_name(&snapshot)?;
+    if let Some(to_snapshot) = &query.to_snapshot {
+        validate_snapshot_name(to_snapshot)?;
+    }
+    Ok(Json(
+        state
+            .helper(
+                &user.username,
+                HelperOperation::DiffSnapshots {
+                    snapshot,
+                    to_snapshot: query.to_snapshot,
+                },
             )
             .await?,
     ))
@@ -2404,6 +3240,123 @@ async fn delete_nfs(
     Ok(Json(serde_json::json!({ "deleted": id, "path": path })))
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct IscsiTarget {
+    id: Option<String>,
+    name: String,
+    portal_group: String,
+    initiator_name: Option<String>,
+    auth_group: String,
+    extent_name: String,
+    path: String,
+    size: Option<String>,
+    lun_id: u32,
+    readonly: bool,
+}
+
+async fn list_iscsi(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    let rows = sqlx::query("select id, name, portal_group, initiator_name, auth_group, extent_name, path, size, lun_id, readonly, created_at from iscsi_targets order by name")
+        .fetch_all(&state.db)
+        .await?;
+    Ok(Json(rows.into_iter().map(row_to_json).collect()))
+}
+
+async fn upsert_iscsi(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<IscsiTarget>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_iscsi_name(&body.name, "target name")?;
+    validate_iscsi_name(&body.portal_group, "portal group")?;
+    validate_optional_iscsi_name(body.initiator_name.as_deref(), "initiator name")?;
+    validate_iscsi_name(&body.auth_group, "auth group")?;
+    validate_iscsi_name(&body.extent_name, "extent name")?;
+    validate_absolute_path(&body.path)?;
+    validate_optional_quota_value(body.size.as_deref(), "extent size")?;
+    if body.lun_id > 1023 {
+        return Err(ApiError::bad_request("LUN id must be between 0 and 1023"));
+    }
+    let id = body.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let initiator_name = normalize_optional_property(body.initiator_name);
+    let size = normalize_optional_property(body.size);
+    state
+        .helper(
+            &user.username,
+            HelperOperation::ApplyIscsiTarget {
+                name: body.name.clone(),
+                portal_group: body.portal_group.clone(),
+                initiator_name: initiator_name.clone(),
+                auth_group: body.auth_group.clone(),
+                extent_name: body.extent_name.clone(),
+                path: body.path.clone(),
+                size: size.clone(),
+                lun_id: body.lun_id,
+                readonly: body.readonly,
+            },
+        )
+        .await?;
+    sqlx::query("insert into iscsi_targets (id, name, portal_group, initiator_name, auth_group, extent_name, path, size, lun_id, readonly, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(id) do update set name = excluded.name, portal_group = excluded.portal_group, initiator_name = excluded.initiator_name, auth_group = excluded.auth_group, extent_name = excluded.extent_name, path = excluded.path, size = excluded.size, lun_id = excluded.lun_id, readonly = excluded.readonly")
+        .bind(&id)
+        .bind(&body.name)
+        .bind(&body.portal_group)
+        .bind(&initiator_name)
+        .bind(&body.auth_group)
+        .bind(&body.extent_name)
+        .bind(&body.path)
+        .bind(&size)
+        .bind(body.lun_id as i64)
+        .bind(if body.readonly { 1 } else { 0 })
+        .bind(Utc::now().to_rfc3339())
+        .execute(&state.db)
+        .await?;
+    state
+        .audit(
+            &user.username,
+            "iscsi",
+            &body.name,
+            "ok",
+            "iSCSI target saved",
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn delete_iscsi(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    let name: String = sqlx::query_scalar("select name from iscsi_targets where id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::not_found("iSCSI target not found"))?;
+    state
+        .helper(
+            &user.username,
+            HelperOperation::DeleteIscsiTarget { name: name.clone() },
+        )
+        .await?;
+    sqlx::query("delete from iscsi_targets where id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+    state
+        .audit(&user.username, "iscsi", &name, "ok", "iSCSI target deleted")
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted": id, "name": name })))
+}
+
 fn row_to_json(row: sqlx::sqlite::SqliteRow) -> serde_json::Value {
     let mut value = BTreeMap::new();
     for column in row.columns() {
@@ -2682,12 +3635,25 @@ fn validate_alert_notification_settings(
     if !settings.smtp_from.is_empty() {
         reject_shell_chars(&settings.smtp_from, "SMTP sender")?;
     }
+    if !settings.smtp_username.is_empty() {
+        reject_shell_chars(&settings.smtp_username, "SMTP username")?;
+    }
+    if !settings.smtp_password.is_empty() {
+        reject_shell_chars(&settings.smtp_password, "SMTP password")?;
+    }
     if settings.webhook_url.len() > 512
         || settings.email_to.len() > 320
         || settings.smtp_host.len() > 255
         || settings.smtp_from.len() > 320
+        || settings.smtp_username.len() > 255
+        || settings.smtp_password.len() > 255
     {
         return Err(ApiError::bad_request("notification setting is too long"));
+    }
+    if !matches!(settings.smtp_tls.as_str(), "none" | "starttls" | "tls") {
+        return Err(ApiError::bad_request(
+            "SMTP TLS mode must be none, starttls, or tls",
+        ));
     }
     if !settings.webhook_url.is_empty()
         && !(settings.webhook_url.starts_with("https://")
@@ -2726,6 +3692,11 @@ fn validate_alert_notification_settings(
     {
         return Err(ApiError::bad_request(
             "email notifications require SMTP host and sender",
+        ));
+    }
+    if settings.smtp_password.is_empty() != settings.smtp_username.is_empty() {
+        return Err(ApiError::bad_request(
+            "SMTP authentication requires username and password",
         ));
     }
     Ok(())
@@ -2777,16 +3748,18 @@ async fn record_alert_delivery(
 
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedWebhookUrl {
+    tls: bool,
     host: String,
     port: u16,
     path: String,
 }
 
-fn parse_http_webhook_url(url: &str) -> Result<Option<ParsedWebhookUrl>, ApiError> {
-    if url.starts_with("https://") {
-        return Ok(None);
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
+fn parse_webhook_url(url: &str) -> Result<ParsedWebhookUrl, ApiError> {
+    let (tls, rest, default_port) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest, 443)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest, 80)
+    } else {
         return Err(ApiError::bad_request(
             "webhook URL must start with http:// or https://",
         ));
@@ -2804,33 +3777,50 @@ fn parse_http_webhook_url(url: &str) -> Result<Option<ParsedWebhookUrl>, ApiErro
             .map_err(|_| ApiError::bad_request("webhook URL port is invalid"))?;
         (host.to_string(), port)
     } else {
-        (authority.to_string(), 80)
+        (authority.to_string(), default_port)
     };
     if host.is_empty() || path.contains('\r') || path.contains('\n') {
         return Err(ApiError::bad_request("webhook URL is invalid"));
     }
-    Ok(Some(ParsedWebhookUrl { host, port, path }))
+    Ok(ParsedWebhookUrl {
+        tls,
+        host,
+        port,
+        path,
+    })
+}
+
+fn tls_connector() -> TlsConnector {
+    let root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
 }
 
 async fn send_webhook_notification(url: &str, alert: &AlertItem) -> Result<String, ApiError> {
-    let Some(parsed) = parse_http_webhook_url(url)? else {
-        return Ok("https webhook transport requires TLS adapter".into());
-    };
+    let parsed = parse_webhook_url(url)?;
     let payload =
         serde_json::to_string(alert).map_err(|err| ApiError::internal(err.to_string()))?;
-    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port))
-        .await
-        .map_err(|err| ApiError::bad_request(format!("webhook connect failed: {err}")))?;
     let request = build_webhook_http_request(&parsed, &payload);
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|err| ApiError::bad_request(format!("webhook write failed: {err}")))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|err| ApiError::bad_request(format!("webhook read failed: {err}")))?;
+    let response = if parsed.tls {
+        let stream = TcpStream::connect((parsed.host.as_str(), parsed.port))
+            .await
+            .map_err(|err| ApiError::bad_request(format!("webhook connect failed: {err}")))?;
+        let server_name = ServerName::try_from(parsed.host.clone())
+            .map_err(|_| ApiError::bad_request("webhook URL host is invalid"))?;
+        let mut stream = tls_connector()
+            .connect(server_name, stream)
+            .await
+            .map_err(|err| ApiError::bad_request(format!("webhook TLS failed: {err}")))?;
+        write_http_request(&mut stream, &request).await?
+    } else {
+        let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port))
+            .await
+            .map_err(|err| ApiError::bad_request(format!("webhook connect failed: {err}")))?;
+        write_http_request(&mut stream, &request).await?
+    };
     let status_line = String::from_utf8_lossy(&response)
         .lines()
         .next()
@@ -2843,11 +3833,32 @@ async fn send_webhook_notification(url: &str, alert: &AlertItem) -> Result<Strin
     }
 }
 
+async fn write_http_request<S>(stream: &mut S, request: &str) -> Result<Vec<u8>, ApiError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|err| ApiError::bad_request(format!("webhook write failed: {err}")))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("webhook read failed: {err}")))?;
+    Ok(response)
+}
+
 fn build_webhook_http_request(parsed: &ParsedWebhookUrl, payload: &str) -> String {
+    let host = if (parsed.tls && parsed.port == 443) || (!parsed.tls && parsed.port == 80) {
+        parsed.host.clone()
+    } else {
+        format!("{}:{}", parsed.host, parsed.port)
+    };
     format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: bnasmgr-alerts/0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         parsed.path,
-        parsed.host,
+        host,
         payload.len(),
         payload
     )
@@ -2869,17 +3880,24 @@ fn build_smtp_message(settings: &AlertNotificationSettings, alert: &AlertItem) -
 }
 
 fn smtp_command_sequence(settings: &AlertNotificationSettings, message: &str) -> Vec<String> {
-    vec![
-        "HELO bnasmgr.local\r\n".into(),
+    let mut commands = vec![
         format!("MAIL FROM:<{}>\r\n", settings.smtp_from),
         format!("RCPT TO:<{}>\r\n", settings.email_to),
         "DATA\r\n".into(),
         format!("{}\r\n.\r\n", message.replace("\r\n.", "\r\n..")),
         "QUIT\r\n".into(),
-    ]
+    ];
+    if !settings.smtp_username.is_empty() {
+        let credentials = format!("\0{}\0{}", settings.smtp_username, settings.smtp_password);
+        commands.insert(0, format!("AUTH PLAIN {}\r\n", BASE64.encode(credentials)));
+    }
+    commands
 }
 
-async fn read_smtp_response(stream: &mut TcpStream) -> Result<String, ApiError> {
+async fn read_smtp_response<S>(stream: &mut S) -> Result<String, ApiError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buffer = vec![0; 1024];
     let read = stream
         .read(&mut buffer)
@@ -2891,27 +3909,80 @@ async fn read_smtp_response(stream: &mut TcpStream) -> Result<String, ApiError> 
     Ok(String::from_utf8_lossy(&buffer[..read]).to_string())
 }
 
+async fn write_smtp_command<S>(stream: &mut S, command: &str) -> Result<String, ApiError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(command.as_bytes())
+        .await
+        .map_err(|err| ApiError::bad_request(format!("SMTP write failed: {err}")))?;
+    let response = read_smtp_response(stream).await?;
+    if !matches!(response.as_bytes().first(), Some(b'2') | Some(b'3')) {
+        return Err(ApiError::bad_request(format!(
+            "SMTP returned: {}",
+            response.trim()
+        )));
+    }
+    Ok(response)
+}
+
+async fn finish_smtp_delivery<S>(
+    stream: &mut S,
+    settings: &AlertNotificationSettings,
+    message: &str,
+) -> Result<String, ApiError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut last_response = String::new();
+    for command in smtp_command_sequence(settings, message) {
+        last_response = match write_smtp_command(stream, &command).await {
+            Ok(response) => response,
+            Err(err) => return Ok(err.message),
+        };
+    }
+    Ok(format!("SMTP delivered: {}", last_response.trim()))
+}
+
 async fn send_smtp_notification(
     settings: &AlertNotificationSettings,
     alert: &AlertItem,
 ) -> Result<String, ApiError> {
-    let mut stream = TcpStream::connect((settings.smtp_host.as_str(), settings.smtp_port))
+    let stream = TcpStream::connect((settings.smtp_host.as_str(), settings.smtp_port))
         .await
         .map_err(|err| ApiError::bad_request(format!("SMTP connect failed: {err}")))?;
-    let _ = read_smtp_response(&mut stream).await?;
     let message = build_smtp_message(settings, alert);
-    let mut last_response = String::new();
-    for command in smtp_command_sequence(settings, &message) {
-        stream
-            .write_all(command.as_bytes())
+
+    if settings.smtp_tls == "tls" {
+        let server_name = ServerName::try_from(settings.smtp_host.clone())
+            .map_err(|_| ApiError::bad_request("SMTP host is invalid"))?;
+        let mut stream = tls_connector()
+            .connect(server_name, stream)
             .await
-            .map_err(|err| ApiError::bad_request(format!("SMTP write failed: {err}")))?;
-        last_response = read_smtp_response(&mut stream).await?;
-        if !matches!(last_response.as_bytes().first(), Some(b'2') | Some(b'3')) {
-            return Ok(format!("SMTP returned: {}", last_response.trim()));
-        }
+            .map_err(|err| ApiError::bad_request(format!("SMTP TLS failed: {err}")))?;
+        let _ = read_smtp_response(&mut stream).await?;
+        let _ = write_smtp_command(&mut stream, "EHLO bnasmgr.local\r\n").await?;
+        return finish_smtp_delivery(&mut stream, settings, &message).await;
     }
-    Ok(format!("SMTP delivered: {}", last_response.trim()))
+
+    let mut stream = stream;
+    let _ = read_smtp_response(&mut stream).await?;
+    let _ = write_smtp_command(&mut stream, "EHLO bnasmgr.local\r\n").await?;
+
+    if settings.smtp_tls == "starttls" {
+        let _ = write_smtp_command(&mut stream, "STARTTLS\r\n").await?;
+        let server_name = ServerName::try_from(settings.smtp_host.clone())
+            .map_err(|_| ApiError::bad_request("SMTP host is invalid"))?;
+        let mut stream = tls_connector()
+            .connect(server_name, stream)
+            .await
+            .map_err(|err| ApiError::bad_request(format!("SMTP STARTTLS failed: {err}")))?;
+        let _ = write_smtp_command(&mut stream, "EHLO bnasmgr.local\r\n").await?;
+        return finish_smtp_delivery(&mut stream, settings, &message).await;
+    }
+
+    finish_smtp_delivery(&mut stream, settings, &message).await
 }
 
 async fn deliver_alert_notifications(state: &AppState, actor: &str) -> Result<usize, ApiError> {
@@ -2972,13 +4043,22 @@ async fn load_alert_notification_settings(
         .unwrap_or_default())
 }
 
+fn redacted_alert_notification_settings(
+    mut settings: AlertNotificationSettings,
+) -> AlertNotificationSettings {
+    settings.smtp_password.clear();
+    settings
+}
+
 async fn get_alert_notifications(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AlertNotificationSettings>, ApiError> {
     let user = auth(&headers, &state).await?;
     require_admin(&user)?;
-    Ok(Json(load_alert_notification_settings(&state).await?))
+    Ok(Json(redacted_alert_notification_settings(
+        load_alert_notification_settings(&state).await?,
+    )))
 }
 
 async fn save_alert_notifications(
@@ -2988,12 +4068,20 @@ async fn save_alert_notifications(
 ) -> Result<Json<AlertNotificationSettings>, ApiError> {
     let user = auth(&headers, &state).await?;
     require_privileged(&user)?;
-    validate_alert_notification_settings(&body)?;
+    let existing = load_alert_notification_settings(&state).await?;
+    let mut settings = body;
+    if !settings.smtp_username.is_empty()
+        && settings.smtp_password.is_empty()
+        && settings.smtp_username == existing.smtp_username
+    {
+        settings.smtp_password = existing.smtp_password;
+    }
+    validate_alert_notification_settings(&settings)?;
     sqlx::query(
         "insert into app_settings (key, value) values ('alert_notifications', ?)
          on conflict(key) do update set value = excluded.value",
     )
-    .bind(serde_json::to_string(&body).map_err(|err| ApiError::internal(err.to_string()))?)
+    .bind(serde_json::to_string(&settings).map_err(|err| ApiError::internal(err.to_string()))?)
     .execute(&state.db)
     .await?;
     state
@@ -3005,7 +4093,7 @@ async fn save_alert_notifications(
             "alert notification settings saved",
         )
         .await?;
-    Ok(Json(body))
+    Ok(Json(redacted_alert_notification_settings(settings)))
 }
 
 async fn test_alert_notifications(
@@ -3286,32 +4374,36 @@ mod tests {
 
     #[test]
     fn parses_http_webhook_urls() {
-        let parsed = parse_http_webhook_url("http://127.0.0.1:8081/alerts").unwrap();
+        let parsed = parse_webhook_url("http://127.0.0.1:8081/alerts").unwrap();
         assert_eq!(
             parsed,
-            Some(ParsedWebhookUrl {
+            ParsedWebhookUrl {
+                tls: false,
                 host: "127.0.0.1".into(),
                 port: 8081,
                 path: "/alerts".into(),
-            })
+            }
         );
         assert_eq!(
-            parse_http_webhook_url("https://example.com/hook").unwrap(),
-            None
+            parse_webhook_url("https://example.com/hook").unwrap(),
+            ParsedWebhookUrl {
+                tls: true,
+                host: "example.com".into(),
+                port: 443,
+                path: "/hook".into(),
+            }
         );
-        assert!(parse_http_webhook_url("ftp://example.com/hook").is_err());
+        assert!(parse_webhook_url("ftp://example.com/hook").is_err());
     }
 
     #[test]
     fn builds_plain_http_webhook_request() {
         let alert = alert("critical", "test", "target", "message");
         let payload = serde_json::to_string(&alert).unwrap();
-        let parsed = parse_http_webhook_url("http://127.0.0.1:8081/alerts")
-            .unwrap()
-            .unwrap();
+        let parsed = parse_webhook_url("http://127.0.0.1:8081/alerts").unwrap();
         let request = build_webhook_http_request(&parsed, &payload);
         assert!(request.starts_with("POST /alerts HTTP/1.1"));
-        assert!(request.contains("Host: 127.0.0.1"));
+        assert!(request.contains("Host: 127.0.0.1:8081"));
         assert!(request.contains("Content-Type: application/json"));
         assert!(request.contains("\"severity\":\"critical\""));
     }
@@ -3326,6 +4418,9 @@ mod tests {
             smtp_host: "127.0.0.1".into(),
             smtp_port: 25,
             smtp_from: "bnasmgr@example.com".into(),
+            smtp_tls: "starttls".into(),
+            smtp_username: "user".into(),
+            smtp_password: "secret".into(),
         };
         let alert = alert("warning", "disk", "/dev/ada0", "SMART warning");
         let message = build_smtp_message(&settings, &alert);
@@ -3333,6 +4428,7 @@ mod tests {
         assert!(message.contains("To: admin@example.com"));
         assert!(message.contains("SMART warning"));
         let commands = smtp_command_sequence(&settings, &message);
+        assert!(commands[0].starts_with("AUTH PLAIN "));
         assert_eq!(commands[1], "MAIL FROM:<bnasmgr@example.com>\r\n");
         assert_eq!(commands[2], "RCPT TO:<admin@example.com>\r\n");
         assert!(commands[4].ends_with("\r\n.\r\n"));
@@ -3395,6 +4491,78 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(settings["workgroup"], "HOME");
         assert_eq!(settings["netbios_name"], "BNAS");
+    }
+
+    #[tokio::test]
+    async fn iscsi_targets_are_admin_managed() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/shares/iscsi")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"iqn.2026-05.local.bnasmgr:disk0","portal_group":"pg0","initiator_name":"","auth_group":"no-authentication","extent_name":"disk0","path":"/dev/zvol/tank/iscsi/disk0","size":"10G","lun_id":0,"readonly":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = saved["id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/shares/iscsi")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let targets: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(targets[0]["name"], "iqn.2026-05.local.bnasmgr:disk0");
+        assert_eq!(targets[0]["lun_id"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/shares/iscsi")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"bad;target","portal_group":"pg0","auth_group":"no-authentication","extent_name":"disk0","path":"/dev/zvol/tank/iscsi/disk0","lun_id":0,"readonly":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/shares/iscsi/{id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3529,6 +4697,159 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn local_identities_are_admin_managed_and_passwords_redacted() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/groups")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"media","members":["media"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/users")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"media","full_name":"Media User","shell":"/bin/sh","home":"/home/media","groups":["media"],"password":"supersecret","create_home":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/system/users")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let users: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(users[0]["username"], "media");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/audit/helper-history")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let operations = history
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["operation"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(operations.contains("<redacted>"));
+        assert!(!operations.contains("supersecret"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/users")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"bad;user","shell":"/bin/sh","groups":[],"create_home":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn config_backup_export_and_import_redacts_secrets() {
+        let (app, token) = login_admin(test_app().await).await;
+        let backup = serde_json::json!({
+            "version": 1,
+            "exported_at": Utc::now().to_rfc3339(),
+            "app_settings": [{
+                "key": "alert_notifications",
+                "value": r#"{"enabled":true,"min_severity":"warning","webhook_url":"","email_to":"admin@example.com","smtp_host":"127.0.0.1","smtp_port":25,"smtp_from":"bnasmgr@example.com","smtp_tls":"starttls","smtp_username":"alerts","smtp_password":"secret"}"#
+            }],
+            "shares_samba": [],
+            "samba_users": [],
+            "shares_nfs": [{
+                "id": "nfs-one",
+                "path": "/mnt/tank/media",
+                "clients": "192.168.1.0/24",
+                "options": "-maproot=root",
+                "created_at": Utc::now().to_rfc3339()
+            }],
+            "iscsi_targets": [],
+            "snapshot_tasks": [],
+            "replication_tasks": []
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/import")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "backup": backup, "replace": true }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/export")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let exported: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(exported["shares_nfs"][0]["id"], "nfs-one");
+        let settings_value = exported["app_settings"][0]["value"].as_str().unwrap();
+        assert!(settings_value.contains("\"smtp_password\":\"\""));
+        assert!(!settings_value.contains("secret"));
     }
 
     #[tokio::test]
@@ -3759,7 +5080,7 @@ mod tests {
                     .header("authorization", format!("Bearer {token}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"enabled":true,"min_severity":"critical","webhook_url":"https://alerts.example/hook","email_to":"admin@example.com","smtp_host":"127.0.0.1","smtp_port":25,"smtp_from":"bnasmgr@example.com"}"#,
+                        r#"{"enabled":true,"min_severity":"critical","webhook_url":"https://alerts.example/hook","email_to":"admin@example.com","smtp_host":"127.0.0.1","smtp_port":25,"smtp_from":"bnasmgr@example.com","smtp_tls":"starttls","smtp_username":"alerts","smtp_password":"secret"}"#,
                     ))
                     .unwrap(),
             )
@@ -3797,6 +5118,9 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(settings["min_severity"], "critical");
+        assert_eq!(settings["smtp_tls"], "starttls");
+        assert_eq!(settings["smtp_username"], "alerts");
+        assert_eq!(settings["smtp_password"], "");
 
         let response = app
             .clone()
@@ -3892,18 +5216,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replication_tasks_are_admin_managed() {
+    async fn datasets_are_admin_managed_with_confirmation() {
         let (app, token) = login_admin(test_app().await).await;
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/replication/tasks")
+                    .uri("/api/storage/datasets")
                     .header("authorization", format!("Bearer {token}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"source_dataset":"tank/media","destination_dataset":"backup/media","mode":"local","remote_host":"","remote_user":"","cadence":"daily","enabled":true}"#,
+                        r#"{"name":"tank/projects","compression":"zstd","atime":"off","quota":"2T","reservation":"none","mountpoint":"/mnt/tank/projects"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/storage/datasets/properties")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"tank/projects","compression":"lz4","atime":"off","quota":"none","reservation":"none","mountpoint":"/mnt/tank/projects"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/storage/datasets/delete")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"tank/projects"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/storage/datasets/delete")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("x-bnasmgr-confirm", "tank/projects")
+                    .body(Body::from(r#"{"name":"tank/projects"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn replication_tasks_are_admin_managed() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                        .method("POST")
+                        .uri("/api/replication/tasks")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                        r#"{"source_dataset":"tank/media","destination_dataset":"backup/media","mode":"local","remote_host":"","remote_user":"","cadence":"daily","retention_count":2,"enabled":true}"#,
                     ))
                     .unwrap(),
             )
@@ -3913,6 +5305,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let task: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(task["source_dataset"], "tank/media");
+        assert_eq!(task["retention_count"], 2);
         let id = task["id"].as_str().unwrap();
 
         let response = app
@@ -3948,6 +5341,11 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(result["snapshot"].as_str().unwrap().contains("@repl-"));
+        assert_eq!(result["base_snapshot"], "tank/media@repl-20260519-000000");
+        assert_eq!(
+            result["retention_deleted"][0],
+            "tank/media@repl-20260518-000000"
+        );
 
         let response = app
             .clone()
@@ -4125,6 +5523,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_clone_and_diff_are_available_to_admins() {
+        let (app, token) = login_admin(test_app().await).await;
+        let snapshot = "tank/media@daily-2026-05-18";
+        let encoded = "tank%2Fmedia%40daily-2026-05-18";
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/snapshots/{encoded}/clone"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"target_dataset":"tank/media-clone"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let clone: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(clone["target_dataset"], "tank/media-clone");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/snapshots/{encoded}/diff"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let diff: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(diff[0]["change"], "M");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/snapshots/{encoded}/clone"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"target_dataset":"../bad"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(snapshot, "tank/media@daily-2026-05-18");
     }
 
     #[tokio::test]

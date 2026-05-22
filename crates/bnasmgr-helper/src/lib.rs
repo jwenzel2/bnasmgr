@@ -52,6 +52,33 @@ pub enum HelperOperation {
     RollbackSnapshot {
         snapshot: String,
     },
+    CloneSnapshot {
+        snapshot: String,
+        target_dataset: String,
+    },
+    DiffSnapshots {
+        snapshot: String,
+        to_snapshot: Option<String>,
+    },
+    CreateDataset {
+        name: String,
+        compression: Option<String>,
+        atime: Option<String>,
+        quota: Option<String>,
+        reservation: Option<String>,
+        mountpoint: Option<String>,
+    },
+    UpdateDataset {
+        name: String,
+        compression: Option<String>,
+        atime: Option<String>,
+        quota: Option<String>,
+        reservation: Option<String>,
+        mountpoint: Option<String>,
+    },
+    DeleteDataset {
+        name: String,
+    },
     SetQuota {
         dataset: String,
         quota: String,
@@ -89,6 +116,42 @@ pub enum HelperOperation {
     DeleteNfsExport {
         path: String,
     },
+    ApplyIscsiTarget {
+        name: String,
+        portal_group: String,
+        initiator_name: Option<String>,
+        auth_group: String,
+        extent_name: String,
+        path: String,
+        size: Option<String>,
+        lun_id: u32,
+        readonly: bool,
+    },
+    DeleteIscsiTarget {
+        name: String,
+    },
+    ListLocalUsers,
+    UpsertLocalUser {
+        username: String,
+        full_name: Option<String>,
+        shell: String,
+        home: Option<String>,
+        groups: Vec<String>,
+        password: Option<String>,
+        create_home: bool,
+    },
+    DeleteLocalUser {
+        username: String,
+        remove_home: bool,
+    },
+    ListLocalGroups,
+    UpsertLocalGroup {
+        name: String,
+        members: Vec<String>,
+    },
+    DeleteLocalGroup {
+        name: String,
+    },
     ServiceStatus {
         service: String,
     },
@@ -113,6 +176,7 @@ pub enum HelperOperation {
     },
     RunReplication {
         snapshot: String,
+        base_snapshot: Option<String>,
         destination_dataset: String,
         remote_host: Option<String>,
         remote_user: Option<String>,
@@ -205,8 +269,8 @@ impl HelperClient for MockHelper {
                 data: serde_json::json!({
                     "pools": [{"name": "tank", "health": "online", "used": "1.2T", "available": "6.8T"}],
                     "datasets": [
-                        {"name":"tank/media","used":"820G","available":"5.4T","quota":"6T","mountpoint":"/mnt/tank/media","health":"online","snapshots":12},
-                        {"name":"tank/backups","used":"410G","available":"1.4T","quota":"2T","mountpoint":"/mnt/tank/backups","health":"online","snapshots":31}
+                        {"name":"tank/media","used":"820G","available":"5.4T","quota":"6T","reservation":null,"mountpoint":"/mnt/tank/media","compression":"lz4","atime":"off","health":"online","snapshots":12},
+                        {"name":"tank/backups","used":"410G","available":"1.4T","quota":"2T","reservation":null,"mountpoint":"/mnt/tank/backups","compression":"zstd","atime":"off","health":"online","snapshots":31}
                     ]
                 }),
             },
@@ -262,7 +326,9 @@ impl HelperClient for MockHelper {
                     target: ds.clone(),
                     message: "mock snapshots loaded".into(),
                     data: serde_json::json!([
-                        {"name": format!("{ds}@daily-2026-05-18"), "dataset": ds, "created_at": now, "used": "42M"}
+                        {"name": format!("{ds}@daily-2026-05-18"), "dataset": ds, "created_at": now, "used": "42M"},
+                        {"name": format!("{ds}@repl-20260518-000000"), "dataset": ds, "created_at": now - chrono::Duration::days(2), "used": "18M"},
+                        {"name": format!("{ds}@repl-20260519-000000"), "dataset": ds, "created_at": now - chrono::Duration::days(1), "used": "12M"}
                     ]),
                 }
             }
@@ -286,6 +352,49 @@ impl HelperClient for MockHelper {
                 target: snapshot,
                 message: "snapshot rolled back".into(),
                 data: serde_json::json!({}),
+            },
+            HelperOperation::CloneSnapshot {
+                snapshot,
+                target_dataset,
+            } => HelperResponse {
+                ok: true,
+                category: "snapshot_clone".into(),
+                target: target_dataset.clone(),
+                message: "mock snapshot cloned".into(),
+                data: serde_json::json!({ "snapshot": snapshot, "target_dataset": target_dataset }),
+            },
+            HelperOperation::DiffSnapshots {
+                snapshot,
+                to_snapshot,
+            } => HelperResponse {
+                ok: true,
+                category: "snapshot_diff".into(),
+                target: snapshot.clone(),
+                message: "mock snapshot diff loaded".into(),
+                data: serde_json::json!([
+                    {"change":"M","file_type":"F","path":"/mnt/tank/media/report.txt","timestamp": now, "to_snapshot": to_snapshot}
+                ]),
+            },
+            HelperOperation::CreateDataset { name, .. } => HelperResponse {
+                ok: true,
+                category: "dataset".into(),
+                target: name.clone(),
+                message: "mock dataset created".into(),
+                data: serde_json::json!({ "name": name }),
+            },
+            HelperOperation::UpdateDataset { name, .. } => HelperResponse {
+                ok: true,
+                category: "dataset".into(),
+                target: name.clone(),
+                message: "mock dataset properties updated".into(),
+                data: serde_json::json!({ "name": name }),
+            },
+            HelperOperation::DeleteDataset { name } => HelperResponse {
+                ok: true,
+                category: "dataset".into(),
+                target: name.clone(),
+                message: "mock dataset deleted".into(),
+                data: serde_json::json!({ "deleted": name }),
             },
             HelperOperation::SetQuota { dataset, quota } => HelperResponse {
                 ok: true,
@@ -347,6 +456,66 @@ impl HelperClient for MockHelper {
                 category: "nfs".into(),
                 target: path,
                 message: "nfs export removed".into(),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::ApplyIscsiTarget { name, .. } => HelperResponse {
+                ok: true,
+                category: "iscsi".into(),
+                target: name,
+                message: "mock iSCSI target applied".into(),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::DeleteIscsiTarget { name } => HelperResponse {
+                ok: true,
+                category: "iscsi".into(),
+                target: name,
+                message: "mock iSCSI target deleted".into(),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::ListLocalUsers => HelperResponse {
+                ok: true,
+                category: "local_user".into(),
+                target: "all".into(),
+                message: "mock local users loaded".into(),
+                data: serde_json::json!([
+                    {"username":"media","uid":1001,"gid":1001,"full_name":"Media User","home":"/home/media","shell":"/bin/sh"}
+                ]),
+            },
+            HelperOperation::UpsertLocalUser { username, .. } => HelperResponse {
+                ok: true,
+                category: "local_user".into(),
+                target: username,
+                message: "mock local user saved".into(),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::DeleteLocalUser { username, .. } => HelperResponse {
+                ok: true,
+                category: "local_user".into(),
+                target: username,
+                message: "mock local user deleted".into(),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::ListLocalGroups => HelperResponse {
+                ok: true,
+                category: "local_group".into(),
+                target: "all".into(),
+                message: "mock local groups loaded".into(),
+                data: serde_json::json!([
+                    {"name":"media","gid":1001,"members":["media"]}
+                ]),
+            },
+            HelperOperation::UpsertLocalGroup { name, .. } => HelperResponse {
+                ok: true,
+                category: "local_group".into(),
+                target: name,
+                message: "mock local group saved".into(),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::DeleteLocalGroup { name } => HelperResponse {
+                ok: true,
+                category: "local_group".into(),
+                target: name,
+                message: "mock local group deleted".into(),
                 data: serde_json::json!({}),
             },
             HelperOperation::ServiceStatus { service } => {
@@ -438,6 +607,7 @@ impl HelperClient for MockHelper {
             },
             HelperOperation::RunReplication {
                 snapshot,
+                base_snapshot,
                 destination_dataset,
                 remote_host,
                 ..
@@ -448,6 +618,7 @@ impl HelperClient for MockHelper {
                 message: "mock replication completed".into(),
                 data: serde_json::json!({
                     "snapshot": snapshot,
+                    "base_snapshot": base_snapshot,
                     "destination_dataset": destination_dataset,
                     "remote": remote_host.is_some()
                 }),
@@ -537,7 +708,7 @@ impl FreeBsdCommandBuilder {
                 "list".into(),
                 "-Hp".into(),
                 "-o".into(),
-                "name,used,avail,quota,mountpoint".into(),
+                "name,used,avail,quota,reservation,mountpoint,compression,atime".into(),
             ],
             HelperOperation::ListSmartDisks => vec!["smartctl".into(), "--scan".into()],
             HelperOperation::StartSmartTest {
@@ -629,6 +800,76 @@ impl FreeBsdCommandBuilder {
                 safe_arg(snapshot)?;
                 vec!["zfs".into(), "rollback".into(), snapshot.clone()]
             }
+            HelperOperation::CloneSnapshot {
+                snapshot,
+                target_dataset,
+            } => {
+                safe_arg(snapshot)?;
+                safe_arg(target_dataset)?;
+                vec![
+                    "zfs".into(),
+                    "clone".into(),
+                    snapshot.clone(),
+                    target_dataset.clone(),
+                ]
+            }
+            HelperOperation::DiffSnapshots {
+                snapshot,
+                to_snapshot,
+            } => {
+                safe_arg(snapshot)?;
+                let mut cmd = vec!["zfs".into(), "diff".into(), "-FHt".into(), snapshot.clone()];
+                if let Some(to_snapshot) = to_snapshot {
+                    safe_arg(to_snapshot)?;
+                    cmd.push(to_snapshot.clone());
+                }
+                cmd
+            }
+            HelperOperation::CreateDataset {
+                name,
+                compression,
+                atime,
+                quota,
+                reservation,
+                mountpoint,
+            } => {
+                safe_arg(name)?;
+                let mut cmd = vec!["zfs".into(), "create".into()];
+                push_dataset_property(&mut cmd, "compression", compression.as_deref())?;
+                push_dataset_property(&mut cmd, "atime", atime.as_deref())?;
+                push_dataset_property(&mut cmd, "quota", quota.as_deref())?;
+                push_dataset_property(&mut cmd, "reservation", reservation.as_deref())?;
+                push_dataset_property(&mut cmd, "mountpoint", mountpoint.as_deref())?;
+                cmd.push(name.clone());
+                cmd
+            }
+            HelperOperation::UpdateDataset {
+                name,
+                compression,
+                atime,
+                quota,
+                reservation,
+                mountpoint,
+            } => {
+                safe_arg(name)?;
+                let mut cmd = vec!["zfs".into(), "set".into()];
+                push_dataset_set_property(&mut cmd, "compression", compression.as_deref())?;
+                push_dataset_set_property(&mut cmd, "atime", atime.as_deref())?;
+                push_dataset_set_property(&mut cmd, "quota", quota.as_deref())?;
+                push_dataset_set_property(&mut cmd, "reservation", reservation.as_deref())?;
+                push_dataset_set_property(&mut cmd, "mountpoint", mountpoint.as_deref())?;
+                if cmd.len() == 2 {
+                    return Err(HelperError::Rejected(
+                        "no dataset properties provided".into(),
+                    ));
+                }
+                cmd.push(name.clone());
+                cmd
+            }
+            HelperOperation::DeleteDataset { name } => {
+                safe_arg(name)?;
+                vec!["zfs".into(), "destroy".into(), name.clone()]
+            }
             HelperOperation::SetQuota { dataset, quota } => {
                 safe_arg(dataset)?;
                 safe_arg(quota)?;
@@ -706,6 +947,94 @@ impl FreeBsdCommandBuilder {
                 safe_arg(path)?;
                 vec!["service".into(), "mountd".into(), "reload".into()]
             }
+            HelperOperation::ApplyIscsiTarget {
+                name,
+                portal_group,
+                initiator_name,
+                auth_group,
+                extent_name,
+                path,
+                size,
+                ..
+            } => {
+                for value in [name, portal_group, auth_group, extent_name, path] {
+                    safe_arg(value)?;
+                }
+                if let Some(initiator_name) = initiator_name {
+                    safe_arg(initiator_name)?;
+                }
+                if let Some(size) = size {
+                    safe_arg(size)?;
+                }
+                vec!["service".into(), "ctld".into(), "reload".into()]
+            }
+            HelperOperation::DeleteIscsiTarget { name } => {
+                safe_arg(name)?;
+                vec!["service".into(), "ctld".into(), "reload".into()]
+            }
+            HelperOperation::ListLocalUsers => vec!["pw".into(), "usershow".into(), "-a".into()],
+            HelperOperation::UpsertLocalUser {
+                username,
+                full_name,
+                shell,
+                home,
+                groups,
+                password,
+                create_home,
+            } => {
+                safe_arg(username)?;
+                safe_arg(shell)?;
+                for group in groups {
+                    safe_arg(group)?;
+                }
+                let mut cmd = vec!["pw".into(), "useradd".into(), username.clone()];
+                if *create_home {
+                    cmd.push("-m".into());
+                }
+                cmd.extend(["-s".into(), shell.clone()]);
+                if let Some(full_name) = full_name {
+                    safe_arg(full_name)?;
+                    cmd.extend(["-c".into(), full_name.clone()]);
+                }
+                if let Some(home) = home {
+                    safe_arg(home)?;
+                    cmd.extend(["-d".into(), home.clone()]);
+                }
+                if !groups.is_empty() {
+                    cmd.extend(["-G".into(), groups.join(",")]);
+                }
+                if password.is_some() {
+                    cmd.extend(["-h".into(), "0".into()]);
+                }
+                cmd
+            }
+            HelperOperation::DeleteLocalUser {
+                username,
+                remove_home,
+            } => {
+                safe_arg(username)?;
+                let mut cmd = vec!["pw".into(), "userdel".into(), username.clone()];
+                if *remove_home {
+                    cmd.push("-r".into());
+                }
+                cmd
+            }
+            HelperOperation::ListLocalGroups => vec!["pw".into(), "groupshow".into(), "-a".into()],
+            HelperOperation::UpsertLocalGroup { name, members } => {
+                safe_arg(name)?;
+                for member in members {
+                    safe_arg(member)?;
+                }
+                let mut cmd = vec!["pw".into(), "groupadd".into(), name.clone()];
+                if !members.is_empty() {
+                    cmd.extend(["-M".into(), members.join(",")]);
+                }
+                cmd
+            }
+            HelperOperation::DeleteLocalGroup { name } => {
+                safe_arg(name)?;
+                vec!["pw".into(), "groupdel".into(), name.clone()]
+            }
             HelperOperation::ServiceStatus { service } => {
                 safe_arg(service)?;
                 if !allowed_service(service) {
@@ -759,11 +1088,15 @@ impl FreeBsdCommandBuilder {
             }
             HelperOperation::RunReplication {
                 snapshot,
+                base_snapshot,
                 destination_dataset,
                 remote_host,
                 remote_user,
             } => {
                 safe_arg(snapshot)?;
+                if let Some(base_snapshot) = base_snapshot {
+                    safe_arg(base_snapshot)?;
+                }
                 safe_arg(destination_dataset)?;
                 if let Some(host) = remote_host {
                     safe_arg(host)?;
@@ -771,16 +1104,20 @@ impl FreeBsdCommandBuilder {
                 if let Some(user) = remote_user {
                     safe_arg(user)?;
                 }
-                vec![
-                    "zfs".into(),
-                    "send".into(),
+                let mut args = vec!["zfs".into(), "send".into()];
+                if let Some(base_snapshot) = base_snapshot {
+                    args.push("-i".into());
+                    args.push(base_snapshot.clone());
+                }
+                args.extend([
                     snapshot.clone(),
                     "|".into(),
                     "zfs".into(),
                     "receive".into(),
                     "-F".into(),
                     destination_dataset.clone(),
-                ]
+                ]);
+                args
             }
         };
         Ok(cmd)
@@ -810,6 +1147,80 @@ pub fn valid_quota(quota: &str) -> bool {
             .all(|ch| matches!(ch, '0'..='9' | 'K' | 'M' | 'G' | 'T' | 'P' | 'E'))
 }
 
+pub fn valid_dataset_compression(value: &str) -> bool {
+    matches!(value, "on" | "off" | "lz4" | "zstd" | "gzip")
+        || value
+            .strip_prefix("gzip-")
+            .and_then(|level| level.parse::<u8>().ok())
+            .is_some_and(|level| (1..=9).contains(&level))
+        || value
+            .strip_prefix("zstd-")
+            .and_then(|level| level.parse::<u8>().ok())
+            .is_some_and(|level| (1..=19).contains(&level))
+}
+
+pub fn valid_dataset_on_off(value: &str) -> bool {
+    matches!(value, "on" | "off")
+}
+
+pub fn valid_dataset_mountpoint(value: &str) -> bool {
+    matches!(value, "none" | "legacy")
+        || (value.starts_with('/')
+            && !value.contains('\0')
+            && !value.contains('\n')
+            && !value.contains(';')
+            && !value.contains('&')
+            && !value.contains('|')
+            && !value.contains('`')
+            && !value.contains("/../")
+            && !value.ends_with("/.."))
+}
+
+fn valid_dataset_property(name: &str, value: &str) -> bool {
+    match name {
+        "compression" => valid_dataset_compression(value),
+        "atime" => valid_dataset_on_off(value),
+        "quota" | "reservation" => valid_quota(value),
+        "mountpoint" => valid_dataset_mountpoint(value),
+        _ => false,
+    }
+}
+
+fn push_dataset_property(
+    cmd: &mut Vec<String>,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), HelperError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    if !valid_dataset_property(name, value) {
+        return Err(HelperError::Rejected(format!(
+            "invalid dataset {name} value"
+        )));
+    }
+    cmd.push("-o".into());
+    cmd.push(format!("{name}={value}"));
+    Ok(())
+}
+
+fn push_dataset_set_property(
+    cmd: &mut Vec<String>,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), HelperError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    if !valid_dataset_property(name, value) {
+        return Err(HelperError::Rejected(format!(
+            "invalid dataset {name} value"
+        )));
+    }
+    cmd.push(format!("{name}={value}"));
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub struct FreeBsdHelper;
 
@@ -827,6 +1238,9 @@ impl HelperClient for FreeBsdHelper {
                 return freebsd_pool_scrub_status(&operation).await
             }
             HelperOperation::ListSnapshots { .. } => return freebsd_snapshots(&operation).await,
+            HelperOperation::DiffSnapshots { .. } => {
+                return freebsd_snapshot_diff(&operation).await
+            }
             HelperOperation::ServiceStatus { .. } => {
                 return freebsd_service_status(&operation).await
             }
@@ -835,7 +1249,9 @@ impl HelperClient for FreeBsdHelper {
             | HelperOperation::DeleteSambaShare { .. }
             | HelperOperation::ApplySambaServerSettings { .. }
             | HelperOperation::ApplyNfsExport { .. }
-            | HelperOperation::DeleteNfsExport { .. } => {
+            | HelperOperation::DeleteNfsExport { .. }
+            | HelperOperation::ApplyIscsiTarget { .. }
+            | HelperOperation::DeleteIscsiTarget { .. } => {
                 return freebsd_apply_share_fragment(&operation).await
             }
             HelperOperation::UpsertSambaUser { .. } => {
@@ -849,6 +1265,11 @@ impl HelperClient for FreeBsdHelper {
             }
             HelperOperation::RunReplication { .. } => {
                 return freebsd_run_replication(&operation).await
+            }
+            HelperOperation::ListLocalUsers => return freebsd_local_users().await,
+            HelperOperation::ListLocalGroups => return freebsd_local_groups().await,
+            HelperOperation::UpsertLocalUser { .. } => {
+                return freebsd_upsert_local_user(&operation).await
             }
             _ => {}
         }
@@ -1073,6 +1494,27 @@ async fn freebsd_snapshots(operation: &HelperOperation) -> Result<HelperResponse
     })
 }
 
+async fn freebsd_snapshot_diff(operation: &HelperOperation) -> Result<HelperResponse, HelperError> {
+    let cmd = FreeBsdCommandBuilder::build(operation)?;
+    let output = run_command(cmd).await?;
+    let (category, target) = operation_category_target(operation);
+    Ok(HelperResponse {
+        ok: output.ok,
+        category,
+        target,
+        message: if output.ok {
+            "snapshot diff loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            serde_json::json!(parse_zfs_diff(&output.stdout))
+        } else {
+            serde_json::json!([])
+        },
+    })
+}
+
 async fn freebsd_pool_scrub_status(
     operation: &HelperOperation,
 ) -> Result<HelperResponse, HelperError> {
@@ -1228,6 +1670,45 @@ async fn freebsd_apply_share_fragment(
             );
             remove_if_exists(dir.join(format!("{}.exports", safe_file_stem(path)?))).await?;
         }
+        HelperOperation::ApplyIscsiTarget {
+            name,
+            portal_group,
+            initiator_name,
+            auth_group,
+            extent_name,
+            path,
+            size,
+            lun_id,
+            readonly,
+        } => {
+            let dir = config_dir(
+                "BNASMGR_ISCSI_INCLUDE_DIR",
+                "/usr/local/etc/bnasmgr/ctl.conf.d",
+            );
+            let file = dir.join(format!("{}.conf", safe_file_stem(name)?));
+            atomic_write(
+                &file,
+                &render_iscsi_target(
+                    name,
+                    portal_group,
+                    initiator_name.as_deref(),
+                    auth_group,
+                    extent_name,
+                    path,
+                    size.as_deref(),
+                    *lun_id,
+                    *readonly,
+                ),
+            )
+            .await?;
+        }
+        HelperOperation::DeleteIscsiTarget { name } => {
+            let dir = config_dir(
+                "BNASMGR_ISCSI_INCLUDE_DIR",
+                "/usr/local/etc/bnasmgr/ctl.conf.d",
+            );
+            remove_if_exists(dir.join(format!("{}.conf", safe_file_stem(name)?))).await?;
+        }
         _ => return Err(HelperError::Rejected("expected share operation".into())),
     }
 
@@ -1360,6 +1841,7 @@ async fn freebsd_run_replication(
 ) -> Result<HelperResponse, HelperError> {
     let HelperOperation::RunReplication {
         snapshot,
+        base_snapshot,
         destination_dataset,
         remote_host,
         remote_user,
@@ -1370,10 +1852,17 @@ async fn freebsd_run_replication(
         ));
     };
     validate_snapshot_name(snapshot)?;
+    if let Some(base_snapshot) = base_snapshot {
+        validate_snapshot_name(base_snapshot)?;
+    }
     FreeBsdCommandBuilder::build(operation)?;
 
-    let mut send = Command::new("zfs")
-        .arg("send")
+    let mut send_command = Command::new("zfs");
+    send_command.arg("send");
+    if let Some(base_snapshot) = base_snapshot {
+        send_command.arg("-i").arg(base_snapshot);
+    }
+    let mut send = send_command
         .arg(snapshot)
         .stdout(Stdio::piped())
         .spawn()
@@ -1444,6 +1933,7 @@ async fn freebsd_run_replication(
         },
         data: serde_json::json!({
             "snapshot": snapshot,
+            "base_snapshot": base_snapshot,
             "destination_dataset": destination_dataset,
             "remote": remote_host.is_some(),
             "send_status": send_status.code(),
@@ -1640,6 +2130,52 @@ fn render_samba_server_settings(
 
 fn render_nfs_export(path: &str, clients: &str, options: &str) -> String {
     format!("{path} {options} {clients}\n")
+}
+
+fn render_iscsi_target(
+    name: &str,
+    portal_group: &str,
+    initiator_name: Option<&str>,
+    auth_group: &str,
+    extent_name: &str,
+    path: &str,
+    size: Option<&str>,
+    lun_id: u32,
+    readonly: bool,
+) -> String {
+    let mut lines = vec![
+        format!("portal-group {portal_group} {{"),
+        "    discovery-auth-group no-authentication".into(),
+        "    listen 0.0.0.0".into(),
+        "}".into(),
+        String::new(),
+        format!("extent {extent_name} {{"),
+        format!("    path {path}"),
+    ];
+    if let Some(size) = size.filter(|value| !value.is_empty()) {
+        lines.push(format!("    size {size}"));
+    }
+    if readonly {
+        lines.push("    option readonly on".into());
+    }
+    lines.extend([
+        "}".into(),
+        String::new(),
+        format!("target {name} {{"),
+        format!("    auth-group {auth_group}"),
+        format!("    portal-group {portal_group}"),
+    ]);
+    if let Some(initiator_name) = initiator_name.filter(|value| !value.is_empty()) {
+        lines.push(format!("    initiator-name {initiator_name}"));
+    }
+    lines.extend([
+        format!("    lun {lun_id} {{"),
+        format!("        extent {extent_name}"),
+        "    }".into(),
+        "}".into(),
+        String::new(),
+    ]);
+    lines.join("\n")
 }
 
 async fn freebsd_upsert_samba_user(
@@ -1903,7 +2439,13 @@ fn parse_zfs_datasets(
                 "none" | "-" => None,
                 value => Some(value.to_string()),
             };
+            let reservation = match fields.next().unwrap_or("none") {
+                "none" | "-" => None,
+                value => Some(value.to_string()),
+            };
             let mountpoint = fields.next().unwrap_or("-").to_string();
+            let compression = fields.next().unwrap_or("-").to_string();
+            let atime = fields.next().unwrap_or("-").to_string();
             let pool = name.split('/').next().unwrap_or(&name);
             let health = pool_health
                 .get(pool)
@@ -1914,7 +2456,10 @@ fn parse_zfs_datasets(
                 "used": used,
                 "available": available,
                 "quota": quota,
+                "reservation": reservation,
                 "mountpoint": mountpoint,
+                "compression": compression,
+                "atime": atime,
                 "health": health,
                 "snapshots": snapshot_counts.get(line.split('\t').next().unwrap_or_default()).copied().unwrap_or(0),
             }))
@@ -1941,6 +2486,76 @@ fn parse_zfs_snapshots(stdout: &str) -> Vec<SnapshotInfo> {
                 created_at,
                 used,
             })
+        })
+        .collect()
+}
+
+fn parse_zfs_diff(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() < 3 {
+                return None;
+            }
+            let (timestamp, change, file_type, path) = if fields.len() >= 4 {
+                (
+                    fields[0].parse::<i64>().ok(),
+                    fields[1],
+                    Some(fields[2]),
+                    fields[3],
+                )
+            } else {
+                (fields[0].parse::<i64>().ok(), fields[1], None, fields[2])
+            };
+            Some(serde_json::json!({
+                "timestamp": timestamp.and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0)).map(|value| value.to_rfc3339()),
+                "change": change,
+                "file_type": file_type,
+                "path": path,
+            }))
+        })
+        .collect()
+}
+
+fn parse_pw_users(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            if fields.len() < 7 {
+                return None;
+            }
+            Some(serde_json::json!({
+                "username": fields[0],
+                "uid": fields[2].parse::<u32>().ok(),
+                "gid": fields[3].parse::<u32>().ok(),
+                "full_name": fields[4],
+                "home": fields[5],
+                "shell": fields[6],
+            }))
+        })
+        .collect()
+}
+
+fn parse_pw_groups(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            if fields.len() < 4 {
+                return None;
+            }
+            let members = fields[3]
+                .split(',')
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+            Some(serde_json::json!({
+                "name": fields[0],
+                "gid": fields[2].parse::<u32>().ok(),
+                "members": members,
+            }))
         })
         .collect()
 }
@@ -2070,6 +2685,81 @@ fn parse_log_timestamp(line: &str) -> Option<DateTime<Utc>> {
     ))
 }
 
+async fn freebsd_local_users() -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(
+        &HelperOperation::ListLocalUsers,
+    )?)
+    .await?;
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "local_user".into(),
+        target: "all".into(),
+        message: if output.ok {
+            "local users loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            serde_json::json!(parse_pw_users(&output.stdout))
+        } else {
+            serde_json::json!([])
+        },
+    })
+}
+
+async fn freebsd_local_groups() -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(
+        &HelperOperation::ListLocalGroups,
+    )?)
+    .await?;
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "local_group".into(),
+        target: "all".into(),
+        message: if output.ok {
+            "local groups loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            serde_json::json!(parse_pw_groups(&output.stdout))
+        } else {
+            serde_json::json!([])
+        },
+    })
+}
+
+async fn freebsd_upsert_local_user(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::UpsertLocalUser {
+        username, password, ..
+    } = operation
+    else {
+        return Err(HelperError::Rejected(
+            "expected local user operation".into(),
+        ));
+    };
+    let output = if let Some(password) = password {
+        let mut stdin = password.clone();
+        stdin.push('\n');
+        run_command_with_stdin(FreeBsdCommandBuilder::build(operation)?, stdin.as_bytes()).await?
+    } else {
+        run_command(FreeBsdCommandBuilder::build(operation)?).await?
+    };
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "local_user".into(),
+        target: username.clone(),
+        message: if output.ok {
+            "local user saved".into()
+        } else {
+            output.stderr
+        },
+        data: serde_json::json!({ "status": output.status }),
+    })
+}
+
 pub fn operation_category_target(operation: &HelperOperation) -> (String, String) {
     match operation {
         HelperOperation::ListStorage => ("storage".into(), "overview".into()),
@@ -2089,6 +2779,19 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
         }
         HelperOperation::DeleteSnapshot { snapshot }
         | HelperOperation::RollbackSnapshot { snapshot } => ("snapshot".into(), snapshot.clone()),
+        HelperOperation::CloneSnapshot {
+            snapshot,
+            target_dataset,
+        } => (
+            "snapshot_clone".into(),
+            format!("{snapshot} -> {target_dataset}"),
+        ),
+        HelperOperation::DiffSnapshots { snapshot, .. } => {
+            ("snapshot_diff".into(), snapshot.clone())
+        }
+        HelperOperation::CreateDataset { name, .. }
+        | HelperOperation::UpdateDataset { name, .. }
+        | HelperOperation::DeleteDataset { name } => ("dataset".into(), name.clone()),
         HelperOperation::SetQuota { dataset, .. } => ("quota".into(), dataset.clone()),
         HelperOperation::ApplySambaServerSettings { workgroup, .. } => {
             ("samba_settings".into(), workgroup.clone())
@@ -2099,6 +2802,16 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
         | HelperOperation::DeleteSambaUser { username } => ("samba_user".into(), username.clone()),
         HelperOperation::ApplyNfsExport { path, .. }
         | HelperOperation::DeleteNfsExport { path } => ("nfs".into(), path.clone()),
+        HelperOperation::ApplyIscsiTarget { name, .. }
+        | HelperOperation::DeleteIscsiTarget { name } => ("iscsi".into(), name.clone()),
+        HelperOperation::ListLocalUsers => ("local_user".into(), "all".into()),
+        HelperOperation::UpsertLocalUser { username, .. }
+        | HelperOperation::DeleteLocalUser { username, .. } => {
+            ("local_user".into(), username.clone())
+        }
+        HelperOperation::ListLocalGroups => ("local_group".into(), "all".into()),
+        HelperOperation::UpsertLocalGroup { name, .. }
+        | HelperOperation::DeleteLocalGroup { name } => ("local_group".into(), name.clone()),
         HelperOperation::ServiceStatus { service }
         | HelperOperation::ServiceAction { service, .. } => ("service".into(), service.clone()),
         HelperOperation::ReadLogs { service, .. } => (
@@ -2149,6 +2862,68 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("invalid quota") || err.to_string().contains("unsafe"));
+    }
+
+    #[test]
+    fn dataset_crud_commands_are_validated() {
+        let create = FreeBsdCommandBuilder::build(&HelperOperation::CreateDataset {
+            name: "tank/projects".into(),
+            compression: Some("zstd".into()),
+            atime: Some("off".into()),
+            quota: Some("2T".into()),
+            reservation: Some("none".into()),
+            mountpoint: Some("/mnt/tank/projects".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            create,
+            vec![
+                "zfs",
+                "create",
+                "-o",
+                "compression=zstd",
+                "-o",
+                "atime=off",
+                "-o",
+                "quota=2T",
+                "-o",
+                "reservation=none",
+                "-o",
+                "mountpoint=/mnt/tank/projects",
+                "tank/projects"
+            ]
+        );
+
+        let update = FreeBsdCommandBuilder::build(&HelperOperation::UpdateDataset {
+            name: "tank/projects".into(),
+            compression: Some("lz4".into()),
+            atime: None,
+            quota: Some("none".into()),
+            reservation: None,
+            mountpoint: None,
+        })
+        .unwrap();
+        assert_eq!(
+            update,
+            vec![
+                "zfs",
+                "set",
+                "compression=lz4",
+                "quota=none",
+                "tank/projects"
+            ]
+        );
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::CreateDataset {
+            name: "tank/bad".into(),
+            compression: Some("bad;value".into()),
+            atime: None,
+            quota: None,
+            reservation: None,
+            mountpoint: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid dataset compression"));
     }
 
     #[test]
@@ -2206,6 +2981,7 @@ mod tests {
     fn replication_command_builder_rejects_unsafe_targets() {
         let cmd = FreeBsdCommandBuilder::build(&HelperOperation::RunReplication {
             snapshot: "tank/media@repl-20260520".into(),
+            base_snapshot: None,
             destination_dataset: "backup/media".into(),
             remote_host: None,
             remote_user: None,
@@ -2225,8 +3001,33 @@ mod tests {
             ]
         );
 
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::RunReplication {
+            snapshot: "tank/media@repl-20260521".into(),
+            base_snapshot: Some("tank/media@repl-20260520".into()),
+            destination_dataset: "backup/media".into(),
+            remote_host: None,
+            remote_user: None,
+        })
+        .unwrap();
+        assert_eq!(
+            cmd,
+            vec![
+                "zfs",
+                "send",
+                "-i",
+                "tank/media@repl-20260520",
+                "tank/media@repl-20260521",
+                "|",
+                "zfs",
+                "receive",
+                "-F",
+                "backup/media"
+            ]
+        );
+
         let err = FreeBsdCommandBuilder::build(&HelperOperation::RunReplication {
             snapshot: "tank/media@bad;rm".into(),
+            base_snapshot: None,
             destination_dataset: "backup/media".into(),
             remote_host: None,
             remote_user: None,
@@ -2256,6 +3057,40 @@ mod tests {
     }
 
     #[test]
+    fn builds_snapshot_clone_and_diff_commands() {
+        let clone = FreeBsdCommandBuilder::build(&HelperOperation::CloneSnapshot {
+            snapshot: "tank/media@daily".into(),
+            target_dataset: "tank/media-clone".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            clone,
+            vec!["zfs", "clone", "tank/media@daily", "tank/media-clone"]
+        );
+
+        let diff = FreeBsdCommandBuilder::build(&HelperOperation::DiffSnapshots {
+            snapshot: "tank/media@daily".into(),
+            to_snapshot: Some("tank/media@weekly".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            diff,
+            vec![
+                "zfs",
+                "diff",
+                "-FHt",
+                "tank/media@daily",
+                "tank/media@weekly"
+            ]
+        );
+
+        let rows = parse_zfs_diff("1779120000\tM\tF\t/mnt/tank/media/report.txt\n");
+        assert_eq!(rows[0]["change"], "M");
+        assert_eq!(rows[0]["file_type"], "F");
+        assert_eq!(rows[0]["path"], "/mnt/tank/media/report.txt");
+    }
+
+    #[test]
     fn rejects_unsafe_arguments() {
         let err = FreeBsdCommandBuilder::build(&HelperOperation::DeleteSnapshot {
             snapshot: "tank/a@snap;rm -rf /".into(),
@@ -2282,6 +3117,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(nfs, vec!["service", "mountd", "reload"]);
+
+        let iscsi = FreeBsdCommandBuilder::build(&HelperOperation::ApplyIscsiTarget {
+            name: "iqn.2026-05.local.bnasmgr:disk0".into(),
+            portal_group: "pg0".into(),
+            initiator_name: None,
+            auth_group: "no-authentication".into(),
+            extent_name: "disk0".into(),
+            path: "/dev/zvol/tank/iscsi/disk0".into(),
+            size: Some("10G".into()),
+            lun_id: 0,
+            readonly: false,
+        })
+        .unwrap();
+        assert_eq!(iscsi, vec!["service", "ctld", "reload"]);
     }
 
     #[test]
@@ -2294,6 +3143,53 @@ mod tests {
         .unwrap();
         assert_eq!(cmd, vec!["smbpasswd", "-a", "-s", "alice"]);
         assert!(!cmd.iter().any(|arg| arg.contains("not-in-argv")));
+    }
+
+    #[test]
+    fn local_identity_commands_do_not_include_passwords() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::UpsertLocalUser {
+            username: "media".into(),
+            full_name: Some("Media User".into()),
+            shell: "/bin/sh".into(),
+            home: Some("/home/media".into()),
+            groups: vec!["wheel".into(), "media".into()],
+            password: Some("not-in-argv".into()),
+            create_home: true,
+        })
+        .unwrap();
+        assert_eq!(
+            cmd,
+            vec![
+                "pw",
+                "useradd",
+                "media",
+                "-m",
+                "-s",
+                "/bin/sh",
+                "-c",
+                "Media User",
+                "-d",
+                "/home/media",
+                "-G",
+                "wheel,media",
+                "-h",
+                "0"
+            ]
+        );
+        assert!(!cmd.iter().any(|arg| arg.contains("not-in-argv")));
+
+        let group = FreeBsdCommandBuilder::build(&HelperOperation::UpsertLocalGroup {
+            name: "media".into(),
+            members: vec!["media".into(), "alice".into()],
+        })
+        .unwrap();
+        assert_eq!(group, vec!["pw", "groupadd", "media", "-M", "media,alice"]);
+
+        let users = parse_pw_users("media:*:1001:1001:Media User:/home/media:/bin/sh\n");
+        assert_eq!(users[0]["username"], "media");
+        assert_eq!(users[0]["uid"], 1001);
+        let groups = parse_pw_groups("media:*:1001:media,alice\n");
+        assert_eq!(groups[0]["members"][1], "alice");
     }
 
     #[test]
@@ -2311,6 +3207,22 @@ mod tests {
 
         let nfs = render_nfs_export("/mnt/tank/media", "192.168.1.0/24", "-maproot=root");
         assert_eq!(nfs, "/mnt/tank/media -maproot=root 192.168.1.0/24\n");
+
+        let iscsi = render_iscsi_target(
+            "iqn.2026-05.local.bnasmgr:disk0",
+            "pg0",
+            None,
+            "no-authentication",
+            "disk0",
+            "/dev/zvol/tank/iscsi/disk0",
+            Some("10G"),
+            0,
+            true,
+        );
+        assert!(iscsi.contains("target iqn.2026-05.local.bnasmgr:disk0"));
+        assert!(iscsi.contains("extent disk0"));
+        assert!(iscsi.contains("path /dev/zvol/tank/iscsi/disk0"));
+        assert!(iscsi.contains("option readonly on"));
     }
 
     #[test]
@@ -2354,7 +3266,7 @@ mod tests {
         let counts =
             parse_snapshot_counts("tank/media@daily\ntank/media@weekly\ntank/backups@daily\n");
         let datasets = parse_zfs_datasets(
-            "tank/media\t879609302220\t5937362789990\t6597069766656\t/mnt/tank/media\n",
+            "tank/media\t879609302220\t5937362789990\t6597069766656\tnone\t/mnt/tank/media\tlz4\toff\n",
             &pools,
             &counts,
         );
@@ -2363,6 +3275,8 @@ mod tests {
         assert_eq!(datasets[0]["name"], "tank/media");
         assert_eq!(datasets[0]["health"], "online");
         assert_eq!(datasets[0]["snapshots"], 2);
+        assert_eq!(datasets[0]["compression"], "lz4");
+        assert_eq!(datasets[0]["atime"], "off");
     }
 
     #[test]

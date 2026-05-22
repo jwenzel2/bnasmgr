@@ -7,21 +7,26 @@ This file is the durable handoff for the recovered FreeBSD NAS Dashboard MVP pla
 The recovered MVP implementation plan is functionally complete in this repo:
 
 - Rust workspace with `bnasmgr-api` and `bnasmgr-helper`.
-- Svelte dashboard for storage, snapshots, Samba/NFS shares, services, logs, audit, and dashboard users.
+- Svelte dashboard for storage, snapshots, Samba/NFS/iSCSI shares, services, logs, audit, and dashboard users.
 - Dashboard auth with seeded `admin` / `admin`, forced password change, Argon2id hashes, and legacy development hash migration.
-- SQLite persistence for dashboard users, sessions, Samba/NFS share metadata, Samba users, audit events, helper history, and settings.
+- Local Unix user/group listing and mutation through typed helper operations.
+- Operational configuration backup/restore for saved dashboard state with secret redaction.
+- SQLite persistence for dashboard users, sessions, Samba/NFS/iSCSI share metadata, Samba users, audit events, helper history, and settings.
 - Typed helper protocol over a Unix socket, with mock and FreeBSD backends.
-- FreeBSD command construction/parsing for ZFS storage, snapshots, quotas, services, logs, Samba users, and Samba/NFS fragment application.
+- FreeBSD command construction/parsing for ZFS storage, snapshots, quotas, services, logs, Samba users, and Samba/NFS/iSCSI fragment application.
+- Dataset create, property update, and delete workflows for compression, atime, quota, reservation, and mountpoint controls.
 - Service monitoring/control for `zfs`, `samba_server`, `nfsd`, `mountd`, `rpcbind`, `ctld`, and `syslogd`.
 - Pool scrub status plus start/stop controls.
 - SMART disk health inventory with self-test launch and history.
 - Computed alerts for degraded pools, unhealthy disks, stopped services, and failed helper operations.
 - Alert notification channel settings with validation and test audit events.
-- Background alert notification scan with plain HTTP webhook delivery, plain SMTP relay delivery, and per-channel deduped delivery history.
+- Background alert notification scan with HTTP/HTTPS webhook delivery, plain/authenticated/TLS SMTP delivery, and per-channel deduped delivery history.
 - Helper history redacts Samba passwords.
 - Destructive snapshot delete/rollback requires an exact `X-BNASMGR-CONFIRM` header.
+- Snapshot clone and diff workflows for writable point-in-time recovery and change inspection.
+- iSCSI target, extent, and LUN CRUD writes helper-owned `ctl.conf` fragments before `ctld` reload.
 - Snapshot tasks can be stored, run automatically by the API scheduler, manually run, and pruned by retention count for matching task-created snapshot prefixes.
-- Replication tasks can be stored, manually run, and automatically run by the API scheduler for local and remote ZFS send/receive.
+- Replication tasks can be stored, manually run, and automatically run by the API scheduler for local and remote ZFS send/receive, with local incremental bases and replication snapshot retention.
 - FreeBSD deployment notes and manual smoke checklist.
 
 ## Traditional NAS Feature Plan
@@ -29,13 +34,8 @@ The recovered MVP implementation plan is functionally complete in this repo:
 The next implementation track is modeled after common TrueNAS-style NAS administration:
 
 - Scheduled snapshot tasks with cadence and retention metadata.
-- HTTPS webhook transport plus authenticated/TLS SMTP support.
-- Retention-aware incremental replication send/receive.
-- Dataset CRUD, including compression, atime, quota, reservation, and mountpoint controls.
-- Snapshot clone/diff workflows to improve point-in-time recovery.
-- Full iSCSI target/extent/LUN CRUD.
-- Local Unix users/groups and directory service integration.
-- Config backup/restore, UPS integration, network configuration, and system reporting.
+- Directory service integration.
+- UPS integration, network configuration, directory service integration, and system reporting.
 
 ## Verification Commands
 
@@ -59,4 +59,4 @@ The latest local verification passed with these commands.
 - Validate file-level snapshot restore on FreeBSD with a disposable dataset, including datasets where `.zfs/snapshot` visibility differs from defaults.
 - Add automated browser smoke tests for login, first-password-change, storage load, snapshot workflow, service controls, logs, and user management.
 - Decide whether production should keep nginx serving the Svelte build or add static-file serving to `bnasmgr-api`.
-- Implement full iSCSI target CRUD later; the MVP intentionally only monitors/controls `ctld` service status.
+- Wire and validate iSCSI `ctl.conf` fragment inclusion before relying on dashboard-managed targets in production.

@@ -18,25 +18,37 @@
   let sambaSettings = { workgroup: 'WORKGROUP', server_string: 'bnasmgr NAS', netbios_name: 'BNASMGR', security: 'user', map_to_guest: 'Bad User', log_level: '1' };
   let sambaUsers = [];
   let nfsShares = [];
+  let iscsiTargets = [];
   let alerts = [];
-  let alertNotifications = { enabled: false, min_severity: 'warning', webhook_url: '', email_to: '', smtp_host: '', smtp_port: 25, smtp_from: '' };
+  let alertNotifications = { enabled: false, min_severity: 'warning', webhook_url: '', email_to: '', smtp_host: '', smtp_port: 25, smtp_from: '', smtp_tls: 'none', smtp_username: '', smtp_password: '' };
   let alertNotificationHistory = [];
   let logs = [];
   let audit = [];
   let helperHistory = [];
   let users = [];
+  let localUsers = [];
+  let localGroups = [];
+  let datasetForm = { name: 'tank/newdata', compression: 'lz4', atime: 'off', quota: 'none', reservation: 'none', mountpoint: '' };
   let snapshotForm = { dataset: 'tank/media', name: '' };
   let snapshotTaskForm = { dataset: 'tank/media', prefix: 'auto', cadence: 'daily', retention_count: 14, enabled: true };
-  let replicationTaskForm = { source_dataset: 'tank/media', destination_dataset: 'backup/media', mode: 'local', remote_host: '', remote_user: '', cadence: 'daily', enabled: true };
+  let replicationTaskForm = { source_dataset: 'tank/media', destination_dataset: 'backup/media', mode: 'local', remote_host: '', remote_user: '', cadence: 'daily', retention_count: 14, enabled: true };
   let snapshotFileSnapshot = '';
   let snapshotFileSearch = '';
   let snapshotFiles = [];
   let selectedSnapshotFiles = {};
+  let snapshotCloneForm = { snapshot: '', target_dataset: 'tank/clone' };
+  let snapshotDiffForm = { snapshot: '', to_snapshot: '' };
+  let snapshotDiff = [];
   let sambaForm = { name: '', path: '', allowed_users: '', readonly: false };
   let sambaUserForm = { username: '', password: '', enabled: true };
   let nfsForm = { path: '', clients: '', options: '-maproot=root' };
+  let iscsiForm = { name: 'iqn.2026-05.local.bnasmgr:disk0', portal_group: 'pg0', initiator_name: '', auth_group: 'no-authentication', extent_name: 'disk0', path: '/dev/zvol/tank/iscsi/disk0', size: '', lun_id: 0, readonly: false };
   let userForm = { username: '', password: '', is_admin: true };
+  let localUserForm = { username: '', full_name: '', shell: '/bin/sh', home: '', groups: '', password: '', create_home: true };
+  let localGroupForm = { name: '', members: '' };
   let logFilters = { service: '', severity: '', search: '', from: '', to: '' };
+  let configBackupText = '';
+  let configImportReplace = false;
 
   async function request(path, init = {}) {
     error = '';
@@ -134,11 +146,53 @@
     await loadStorage();
   }
 
+  function datasetPropertiesFromForm(form, name) {
+    return {
+      name,
+      compression: String(form.get('compression') || '').trim(),
+      atime: String(form.get('atime') || '').trim(),
+      quota: String(form.get('quota') || '').trim(),
+      reservation: String(form.get('reservation') || '').trim(),
+      mountpoint: String(form.get('mountpoint') || '').trim()
+    };
+  }
+
+  async function createDataset() {
+    await request('/api/storage/datasets', {
+      method: 'POST',
+      body: JSON.stringify(datasetForm)
+    });
+    await loadStorage();
+  }
+
+  async function updateDatasetProperties(dataset, event) {
+    const form = new FormData(event.currentTarget);
+    await request('/api/storage/datasets/properties', {
+      method: 'POST',
+      body: JSON.stringify(datasetPropertiesFromForm(form, dataset))
+    });
+    await loadStorage();
+  }
+
+  async function deleteDataset(dataset) {
+    const confirmed = prompt(`Type ${dataset} to delete this dataset`);
+    if (confirmed !== dataset) return;
+    await request('/api/storage/datasets/delete', {
+      method: 'POST',
+      headers: { 'x-bnasmgr-confirm': dataset },
+      body: JSON.stringify({ name: dataset })
+    });
+    await loadStorage();
+  }
+
   async function loadSnapshots() {
     snapshots = await request(`/api/snapshots?dataset=${encodeURIComponent(snapshotForm.dataset)}`);
     snapshotFileSnapshot = snapshots[0]?.name || '';
+    snapshotCloneForm = { ...snapshotCloneForm, snapshot: snapshots[0]?.name || '' };
+    snapshotDiffForm = { ...snapshotDiffForm, snapshot: snapshots[0]?.name || '' };
     snapshotFiles = [];
     selectedSnapshotFiles = {};
+    snapshotDiff = [];
   }
 
   async function createSnapshot() {
@@ -181,7 +235,10 @@
   async function createReplicationTask() {
     await request('/api/replication/tasks', {
       method: 'POST',
-      body: JSON.stringify(replicationTaskForm)
+      body: JSON.stringify({
+        ...replicationTaskForm,
+        retention_count: Number(replicationTaskForm.retention_count)
+      })
     });
     replicationTaskForm = { ...replicationTaskForm, remote_host: '', remote_user: '' };
     await loadReplicationTasks();
@@ -213,6 +270,22 @@
       method: 'POST',
       headers: { 'x-bnasmgr-confirm': name }
     });
+  }
+
+  async function cloneSnapshot() {
+    if (!snapshotCloneForm.snapshot || !snapshotCloneForm.target_dataset.trim()) return;
+    await request(`/api/snapshots/${encodeURIComponent(snapshotCloneForm.snapshot)}/clone`, {
+      method: 'POST',
+      body: JSON.stringify({ target_dataset: snapshotCloneForm.target_dataset.trim() })
+    });
+    await loadStorage();
+  }
+
+  async function loadSnapshotDiff() {
+    if (!snapshotDiffForm.snapshot) return;
+    const params = new URLSearchParams();
+    if (snapshotDiffForm.to_snapshot.trim()) params.set('to_snapshot', snapshotDiffForm.to_snapshot.trim());
+    snapshotDiff = await request(`/api/snapshots/${encodeURIComponent(snapshotDiffForm.snapshot)}/diff?${params}`);
   }
 
   async function searchSnapshotFiles(name) {
@@ -248,7 +321,7 @@
   }
 
   async function loadShares() {
-    [sambaShares, sambaSettings, sambaUsers, nfsShares] = await Promise.all([request('/api/shares/samba'), request('/api/shares/samba/settings'), request('/api/shares/samba/users'), request('/api/shares/nfs')]);
+    [sambaShares, sambaSettings, sambaUsers, nfsShares, iscsiTargets] = await Promise.all([request('/api/shares/samba'), request('/api/shares/samba/settings'), request('/api/shares/samba/users'), request('/api/shares/nfs'), request('/api/shares/iscsi')]);
   }
 
   async function saveSambaSettings() {
@@ -301,6 +374,21 @@
     await loadShares();
   }
 
+  async function saveIscsi() {
+    await request('/api/shares/iscsi', {
+      method: 'POST',
+      body: JSON.stringify({ ...iscsiForm, lun_id: Number(iscsiForm.lun_id) })
+    });
+    iscsiForm = { ...iscsiForm, name: '', extent_name: '', path: '', size: '', lun_id: 0, readonly: false };
+    await loadShares();
+  }
+
+  async function deleteIscsi(id, name) {
+    if (!confirm(`Delete iSCSI target ${name}?`)) return;
+    await request(`/api/shares/iscsi/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await loadShares();
+  }
+
   async function loadLogs() {
     const params = new URLSearchParams(Object.entries(logFilters).filter(([, v]) => v).map(([key, value]) => {
       if ((key === 'from' || key === 'to') && value) return [key, new Date(value).toISOString()];
@@ -342,7 +430,7 @@
   }
 
   async function loadUsers() {
-    users = await request('/api/users');
+    [users, localUsers, localGroups] = await Promise.all([request('/api/users'), request('/api/system/users'), request('/api/system/groups')]);
   }
 
   async function createUser() {
@@ -373,6 +461,59 @@
     if (!confirm(`Delete dashboard user ${username}?`)) return;
     await request(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
     await loadUsers();
+  }
+
+  async function saveLocalUser() {
+    await request('/api/system/users', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...localUserForm,
+        groups: localUserForm.groups.split(',').map((item) => item.trim()).filter(Boolean),
+        password: localUserForm.password || null
+      })
+    });
+    localUserForm = { ...localUserForm, username: '', full_name: '', home: '', groups: '', password: '' };
+    await loadUsers();
+  }
+
+  async function deleteLocalUser(username) {
+    if (!confirm(`Delete local user ${username}?`)) return;
+    await request(`/api/system/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+    await loadUsers();
+  }
+
+  async function saveLocalGroup() {
+    await request('/api/system/groups', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: localGroupForm.name,
+        members: localGroupForm.members.split(',').map((item) => item.trim()).filter(Boolean)
+      })
+    });
+    localGroupForm = { name: '', members: '' };
+    await loadUsers();
+  }
+
+  async function deleteLocalGroup(name) {
+    if (!confirm(`Delete local group ${name}?`)) return;
+    await request(`/api/system/groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    await loadUsers();
+  }
+
+  async function exportConfig() {
+    const backup = await request('/api/config/export');
+    configBackupText = JSON.stringify(backup, null, 2);
+  }
+
+  async function importConfig() {
+    if (!configBackupText.trim()) return;
+    const backup = JSON.parse(configBackupText);
+    if (configImportReplace && !confirm('Replace existing saved configuration?')) return;
+    await request('/api/config/import', {
+      method: 'POST',
+      body: JSON.stringify({ backup, replace: configImportReplace })
+    });
+    await loadAll();
   }
 
   function logout() {
@@ -431,7 +572,7 @@
   <div class="shell">
     <aside>
       <div class="brand">bnasmgr</div>
-      {#each ['storage', 'snapshots', 'shares', 'services', 'alerts', 'logs', 'audit', 'users'] as tab}
+      {#each ['storage', 'snapshots', 'shares', 'services', 'alerts', 'logs', 'audit', 'users', 'config'] as tab}
         <button class:active={active === tab} on:click={() => active = tab}>{tab}</button>
       {/each}
       <button on:click={logout}>logout</button>
@@ -445,6 +586,28 @@
 
       {#if active === 'storage'}
         <section class="grid storage-grid">
+          <article class="card">
+            <h2>Create dataset</h2>
+            <form class="stack" on:submit|preventDefault={createDataset}>
+              <input bind:value={datasetForm.name} placeholder="dataset name" />
+              <select bind:value={datasetForm.compression}>
+                <option value="">compression: inherit</option>
+                <option value="lz4">compression: lz4</option>
+                <option value="zstd">compression: zstd</option>
+                <option value="on">compression: on</option>
+                <option value="off">compression: off</option>
+              </select>
+              <select bind:value={datasetForm.atime}>
+                <option value="">atime: inherit</option>
+                <option value="off">atime: off</option>
+                <option value="on">atime: on</option>
+              </select>
+              <input bind:value={datasetForm.quota} placeholder="quota, e.g. 2T or none" />
+              <input bind:value={datasetForm.reservation} placeholder="reservation, e.g. 500G or none" />
+              <input bind:value={datasetForm.mountpoint} placeholder="mountpoint, blank for default" />
+              <button>Create dataset</button>
+            </form>
+          </article>
           {#each storage.pools as pool}
             <article class="card pool-card">
               <div>
@@ -480,10 +643,31 @@
                 <span><i class="used"></i>Used {usage(ds).used}</span>
                 <span><i class="free"></i>Free {usage(ds).free}</span>
               </div>
-              <dl><dt>Used</dt><dd>{ds.used}</dd><dt>Available</dt><dd>{ds.available}</dd><dt>Quota</dt><dd>{ds.quota || 'none'}</dd><dt>Mount</dt><dd>{ds.mountpoint}</dd><dt>Snapshots</dt><dd>{ds.snapshots}</dd></dl>
+              <dl><dt>Used</dt><dd>{ds.used}</dd><dt>Available</dt><dd>{ds.available}</dd><dt>Quota</dt><dd>{ds.quota || 'none'}</dd><dt>Reserved</dt><dd>{ds.reservation || 'none'}</dd><dt>Mount</dt><dd>{ds.mountpoint}</dd><dt>Compression</dt><dd>{ds.compression || 'inherit'}</dd><dt>Atime</dt><dd>{ds.atime || 'inherit'}</dd><dt>Snapshots</dt><dd>{ds.snapshots}</dd></dl>
               <form class="quota-form" on:submit|preventDefault={(event) => setQuota(ds.name, event)}>
                 <input name="quota" value={ds.quota || ''} placeholder="quota, e.g. 2T or none" />
                 <button>Set quota</button>
+              </form>
+              <form class="stack" on:submit|preventDefault={(event) => updateDatasetProperties(ds.name, event)}>
+                <select name="compression">
+                  <option value="">compression: unchanged</option>
+                  <option value="lz4">compression: lz4</option>
+                  <option value="zstd">compression: zstd</option>
+                  <option value="on">compression: on</option>
+                  <option value="off">compression: off</option>
+                </select>
+                <select name="atime">
+                  <option value="">atime: unchanged</option>
+                  <option value="off">atime: off</option>
+                  <option value="on">atime: on</option>
+                </select>
+                <input name="quota" value={ds.quota || ''} placeholder="quota" />
+                <input name="reservation" value={ds.reservation || ''} placeholder="reservation" />
+                <input name="mountpoint" value={ds.mountpoint || ''} placeholder="mountpoint" />
+                <div class="actions">
+                  <button>Save properties</button>
+                  <button type="button" on:click={() => deleteDataset(ds.name)}>Delete</button>
+                </div>
               </form>
               <span class:green={ds.health === 'online'} class="status">{ds.health}</span>
             </article>
@@ -544,6 +728,41 @@
           </form>
           <table><tbody>{#each snapshots as snap}<tr><td>{snap.name}</td><td>{snap.used}</td><td><button on:click={() => rollbackSnapshot(snap.name)}>Rollback</button><button on:click={() => deleteSnapshot(snap.name)}>Delete</button></td></tr>{/each}</tbody></table>
           <div class="subpanel">
+            <h2>Clone and diff</h2>
+            <form class="inline" on:submit|preventDefault={cloneSnapshot}>
+              <select bind:value={snapshotCloneForm.snapshot}>
+                <option value="">Select snapshot</option>
+                {#each snapshots as snap}<option value={snap.name}>{snap.name}</option>{/each}
+              </select>
+              <input bind:value={snapshotCloneForm.target_dataset} placeholder="clone dataset" />
+              <button disabled={!snapshotCloneForm.snapshot}>Clone</button>
+            </form>
+            <form class="inline" on:submit|preventDefault={loadSnapshotDiff}>
+              <select bind:value={snapshotDiffForm.snapshot}>
+                <option value="">Base snapshot</option>
+                {#each snapshots as snap}<option value={snap.name}>{snap.name}</option>{/each}
+              </select>
+              <input bind:value={snapshotDiffForm.to_snapshot} placeholder="optional target snapshot" />
+              <button disabled={!snapshotDiffForm.snapshot}>Diff</button>
+            </form>
+            {#if snapshotDiff.length}
+              <table>
+                <tbody>
+                  {#each snapshotDiff as item}
+                    <tr>
+                      <td>{item.change}</td>
+                      <td>{item.file_type || '-'}</td>
+                      <td>{item.path}</td>
+                      <td>{item.timestamp || ''}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {:else}
+              <p class="empty">No diff loaded</p>
+            {/if}
+          </div>
+          <div class="subpanel">
             <h2>Snapshot tasks</h2>
             <form class="inline" on:submit|preventDefault={createSnapshotTask}>
               <input bind:value={snapshotTaskForm.dataset} placeholder="dataset" />
@@ -591,6 +810,7 @@
                 <option value="weekly">weekly</option>
                 <option value="monthly">monthly</option>
               </select>
+              <input bind:value={replicationTaskForm.retention_count} type="number" min="1" max="10000" placeholder="keep" />
               <label class="check"><input type="checkbox" bind:checked={replicationTaskForm.enabled} /> Enabled</label>
               <button>Save replication</button>
             </form>
@@ -603,6 +823,7 @@
                     <td>{task.mode}</td>
                     <td>{task.remote_host || 'local'}</td>
                     <td>{task.cadence}</td>
+                    <td>keep {task.retention_count}</td>
                     <td>{task.enabled ? 'enabled' : 'disabled'}</td>
                     <td>{task.last_run_at || 'never run'}</td>
                     <td><button disabled={!task.enabled} on:click={() => runReplicationTask(task.id)}>Run now</button><button on:click={() => deleteReplicationTask(task.id, task.source_dataset)}>Delete</button></td>
@@ -680,6 +901,22 @@
             </form>
             <ul class="share-list">{#each nfsShares as share}<li><span>{share.path} {share.clients}</span><button on:click={() => deleteNfs(share.id, share.path)}>Delete</button></li>{/each}</ul>
           </div>
+          <div class="panel">
+            <h2>iSCSI</h2>
+            <form class="stack" on:submit|preventDefault={saveIscsi}>
+              <input bind:value={iscsiForm.name} placeholder="target IQN" />
+              <input bind:value={iscsiForm.portal_group} placeholder="portal group" />
+              <input bind:value={iscsiForm.initiator_name} placeholder="initiator name, optional" />
+              <input bind:value={iscsiForm.auth_group} placeholder="auth group" />
+              <input bind:value={iscsiForm.extent_name} placeholder="extent name" />
+              <input bind:value={iscsiForm.path} placeholder="/dev/zvol/tank/iscsi/disk0" />
+              <input bind:value={iscsiForm.size} placeholder="size, optional" />
+              <input bind:value={iscsiForm.lun_id} type="number" min="0" max="1023" placeholder="LUN" />
+              <label class="check"><input type="checkbox" bind:checked={iscsiForm.readonly} /> Read only</label>
+              <button>Save iSCSI target</button>
+            </form>
+            <ul class="share-list">{#each iscsiTargets as target}<li><span>{target.name} LUN {target.lun_id} {target.path}</span><button on:click={() => deleteIscsi(target.id, target.name)}>Delete</button></li>{/each}</ul>
+          </div>
         </section>
       {:else if active === 'services'}
         <section class="grid">
@@ -729,6 +966,13 @@
               <input bind:value={alertNotifications.smtp_host} placeholder="SMTP host" />
               <input bind:value={alertNotifications.smtp_port} type="number" min="1" max="65535" placeholder="SMTP port" />
               <input bind:value={alertNotifications.smtp_from} placeholder="SMTP sender" />
+              <select bind:value={alertNotifications.smtp_tls}>
+                <option value="none">SMTP TLS: none</option>
+                <option value="starttls">SMTP TLS: STARTTLS</option>
+                <option value="tls">SMTP TLS: implicit TLS</option>
+              </select>
+              <input bind:value={alertNotifications.smtp_username} placeholder="SMTP username" />
+              <input bind:value={alertNotifications.smtp_password} type="password" placeholder="SMTP password" />
               <div class="actions">
                 <button>Save notifications</button>
                 <button type="button" disabled={!alertNotifications.enabled} on:click={testAlertNotifications}>Test</button>
@@ -784,6 +1028,7 @@
         </section>
       {:else if active === 'users'}
         <section class="panel">
+          <h2>Dashboard users</h2>
           <form class="inline" on:submit|preventDefault={createUser}>
             <input bind:value={userForm.username} placeholder="username" />
             <input bind:value={userForm.password} type="password" placeholder="temporary password" />
@@ -808,6 +1053,64 @@
               {/each}
             </tbody>
           </table>
+          <div class="subpanel">
+            <h2>Local users</h2>
+            <form class="inline" on:submit|preventDefault={saveLocalUser}>
+              <input bind:value={localUserForm.username} placeholder="username" />
+              <input bind:value={localUserForm.full_name} placeholder="full name" />
+              <input bind:value={localUserForm.shell} placeholder="/bin/sh" />
+              <input bind:value={localUserForm.home} placeholder="home, optional" />
+              <input bind:value={localUserForm.groups} placeholder="groups, comma separated" />
+              <input bind:value={localUserForm.password} type="password" placeholder="password, optional" />
+              <label class="check"><input type="checkbox" bind:checked={localUserForm.create_home} /> Home</label>
+              <button>Save local user</button>
+            </form>
+            <table>
+              <tbody>
+                {#each localUsers as row}
+                  <tr>
+                    <td>{row.username}</td>
+                    <td>{row.uid}</td>
+                    <td>{row.home}</td>
+                    <td>{row.shell}</td>
+                    <td><button on:click={() => deleteLocalUser(row.username)}>Delete</button></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+          <div class="subpanel">
+            <h2>Local groups</h2>
+            <form class="inline" on:submit|preventDefault={saveLocalGroup}>
+              <input bind:value={localGroupForm.name} placeholder="group name" />
+              <input bind:value={localGroupForm.members} placeholder="members, comma separated" />
+              <button>Save local group</button>
+            </form>
+            <table>
+              <tbody>
+                {#each localGroups as row}
+                  <tr>
+                    <td>{row.name}</td>
+                    <td>{row.gid}</td>
+                    <td>{Array.isArray(row.members) ? row.members.join(', ') : ''}</td>
+                    <td><button on:click={() => deleteLocalGroup(row.name)}>Delete</button></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      {:else if active === 'config'}
+        <section class="panel">
+          <div class="toolbar">
+            <h2>Configuration</h2>
+            <button on:click={exportConfig}>Export</button>
+          </div>
+          <form class="stack" on:submit|preventDefault={importConfig}>
+            <textarea bind:value={configBackupText} rows="18" placeholder="configuration backup JSON"></textarea>
+            <label class="check"><input type="checkbox" bind:checked={configImportReplace} /> Replace existing saved configuration</label>
+            <button>Import</button>
+          </form>
         </section>
       {/if}
     </main>
