@@ -73,6 +73,18 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
 
   await page.getByRole('button', { name: 'services' }).click();
   await expect(page.locator('main > header h1')).toHaveText('services');
+  await expect(page.getByRole('heading', { name: 'System', exact: true })).toBeVisible();
+  await expect(page.getByText('bnasmgr-mock')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Network' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'em0' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: '192.168.1.50' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'UPS' })).toBeVisible();
+  await expect(page.getByText('Mock UPS 1500')).toBeVisible();
+  const upsPolicyForm = page.locator('form').filter({ has: page.getByRole('button', { name: 'Save UPS policy' }) });
+  await upsPolicyForm.getByLabel('Policy enabled').check();
+  await upsPolicyForm.getByPlaceholder('low charge %').fill('25');
+  await upsPolicyForm.getByPlaceholder('minimum runtime seconds').fill('600');
+  await upsPolicyForm.getByRole('button', { name: 'Save UPS policy' }).click();
   const sambaServiceCard = page.locator('article.card').filter({ has: page.getByRole('heading', { name: 'Samba', exact: true }) });
   await expect(sambaServiceCard).toContainText('running');
   await sambaServiceCard.getByRole('button', { name: 'Restart' }).click();
@@ -153,6 +165,7 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
   await expect(configBackup).toHaveValue(/iqn\.2026-05\.local\.bnasmgr:e2e/);
   await page.getByRole('button', { name: 'Import' }).click();
   await expect(configBackup).toHaveValue(/"version": 1/);
+  await expect(configBackup).toHaveValue(/ups_policy/);
 
   await page.getByRole('button', { name: 'shares' }).click();
   page.once('dialog', (dialog) => dialog.accept());

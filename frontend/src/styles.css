@@ -79,6 +79,11 @@ header { display: flex; justify-content: space-between; align-items: center; mar
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 .storage-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
 .disk-panel { margin-top: 14px; }
+.services-grid { margin-top: 14px; }
+.system-grid {
+  grid-template-columns: repeat(5, max-content 1fr);
+  gap: 8px 12px;
+}
 .split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .inline { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: center; margin-bottom: 16px; }
 .stack { display: grid; gap: 10px; margin: 14px 0; }
@@ -109,6 +114,14 @@ header { display: flex; justify-content: space-between; align-items: center; mar
   padding-top: 12px;
 }
 .scrub-status p { margin: 0; color: #35443c; overflow-wrap: anywhere; }
+.ups-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 18px;
+  align-items: start;
+}
+.ups-grid dl { margin: 0; }
+.ups-policy { margin: 18px 0 0; }
 .card-heading {
   display: grid;
   grid-template-columns: 1fr 84px;
@@ -228,8 +241,10 @@ button:disabled {
   .brand { margin: 0 10px 0 0; }
   main { padding: 16px; }
   .split, .inline { grid-template-columns: 1fr; }
+  .system-grid { grid-template-columns: max-content 1fr; }
   .quota-form { grid-template-columns: 1fr; }
   .pool-card { grid-template-columns: 1fr; }
+  .ups-grid { grid-template-columns: 1fr; }
   .pool-card .usage-legend { grid-column: auto; }
   .usage-chart { width: 112px; }
 }

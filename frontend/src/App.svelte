@@ -14,6 +14,10 @@
   let snapshotTasks = [];
   let replicationTasks = [];
   let services = [];
+  let systemReport = null;
+  let networkInterfaces = [];
+  let upsStatus = null;
+  let upsPolicy = { enabled: false, low_charge_percent: 20, min_runtime_seconds: 300, shutdown_command: 'shutdown -p now' };
   let sambaShares = [];
   let sambaSettings = { workgroup: 'WORKGROUP', server_string: 'bnasmgr NAS', netbios_name: 'BNASMGR', security: 'user', map_to_guest: 'Bad User', log_level: '1' };
   let sambaUsers = [];
@@ -80,7 +84,7 @@
 
   async function loadAll() {
     if (!token || user?.must_change_password) return;
-    await Promise.all([loadStorage(), loadDiskHealth(), loadSnapshots(), loadSnapshotTasks(), loadReplicationTasks(), loadServices(), loadShares(), loadAlerts(), loadAlertNotifications(), loadAlertNotificationHistory(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
+    await Promise.all([loadStorage(), loadDiskHealth(), loadSnapshots(), loadSnapshotTasks(), loadReplicationTasks(), loadServices(), loadSystemReport(), loadNetworkInterfaces(), loadUpsStatus(), loadUpsPolicy(), loadShares(), loadAlerts(), loadAlertNotifications(), loadAlertNotificationHistory(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
   }
 
   async function restoreSession() {
@@ -315,6 +319,46 @@
     services = await request('/api/services');
   }
 
+  async function loadSystemReport() {
+    try {
+      systemReport = await request('/api/system/report');
+    } catch {
+      systemReport = null;
+    }
+  }
+
+  async function loadNetworkInterfaces() {
+    try {
+      networkInterfaces = await request('/api/system/network');
+    } catch {
+      networkInterfaces = [];
+    }
+  }
+
+  async function loadUpsStatus() {
+    try {
+      upsStatus = await request('/api/system/ups');
+    } catch {
+      upsStatus = null;
+    }
+  }
+
+  async function loadUpsPolicy() {
+    upsPolicy = await request('/api/system/ups/policy');
+  }
+
+  async function saveUpsPolicy() {
+    upsPolicy = await request('/api/system/ups/policy', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...upsPolicy,
+        low_charge_percent: Number(upsPolicy.low_charge_percent),
+        min_runtime_seconds: Number(upsPolicy.min_runtime_seconds)
+      })
+    });
+    await loadAlerts();
+  }
+
   async function serviceAction(service, action) {
     await request(`/api/services/${service}/${action}`, { method: 'POST' });
     await loadServices();
@@ -543,6 +587,29 @@
       used: item.used || '0',
       free: item.available || '0'
     };
+  }
+
+  function runtimeLabel(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value <= 0) return 'unknown';
+    const minutes = Math.round(value / 60);
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    const remainder = minutes % 60;
+    return `${hours}h ${remainder}m`;
+  }
+
+  function bytesLabel(bytes) {
+    const value = Number(bytes);
+    if (!Number.isFinite(value) || value <= 0) return 'unknown';
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let current = value;
+    let index = 0;
+    while (current >= 1024 && index < units.length - 1) {
+      current /= 1024;
+      index += 1;
+    }
+    return `${current.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
   }
 
   restoreSession();
@@ -919,7 +986,76 @@
           </div>
         </section>
       {:else if active === 'services'}
-        <section class="grid">
+        <section class="panel">
+          <div class="toolbar">
+            <h2>System</h2>
+            <button on:click={loadSystemReport}>Refresh</button>
+          </div>
+          {#if systemReport}
+            <dl class="system-grid">
+              <dt>Host</dt><dd>{systemReport.hostname}</dd>
+              <dt>OS</dt><dd>{systemReport.os} {systemReport.release}</dd>
+              <dt>Uptime</dt><dd>{runtimeLabel(systemReport.uptime_seconds)}</dd>
+              <dt>Memory</dt><dd>{bytesLabel(systemReport.memory_bytes)}</dd>
+              <dt>Load</dt><dd>{Array.isArray(systemReport.load_average) ? systemReport.load_average.join(', ') : 'unknown'}</dd>
+            </dl>
+          {:else}
+            <p class="empty">System report unavailable</p>
+          {/if}
+        </section>
+        <section class="panel services-grid">
+          <div class="toolbar">
+            <h2>Network</h2>
+            <button on:click={loadNetworkInterfaces}>Refresh</button>
+          </div>
+          {#if networkInterfaces.length}
+            <table>
+              <tbody>
+                {#each networkInterfaces as iface}
+                  <tr>
+                    <td>{iface.name}</td>
+                    <td><span class="status {iface.status === 'active' ? 'green' : 'yellow'}">{iface.status}</span></td>
+                    <td>{iface.mac || '-'}</td>
+                    <td>{Array.isArray(iface.ipv4) && iface.ipv4.length ? iface.ipv4.join(', ') : '-'}</td>
+                    <td>{Array.isArray(iface.ipv6) && iface.ipv6.length ? iface.ipv6.join(', ') : '-'}</td>
+                    <td>mtu {iface.mtu || '-'}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {:else}
+            <p class="empty">No network interfaces loaded</p>
+          {/if}
+        </section>
+        <section class="panel">
+          <div class="toolbar">
+            <h2>UPS</h2>
+            <button on:click={loadUpsStatus}>Refresh</button>
+          </div>
+          {#if upsStatus}
+            <div class="ups-grid">
+              <span class="status {upsStatus.state === 'online' ? 'green' : upsStatus.state === 'on_battery' ? 'yellow' : 'red'}">{upsStatus.state}</span>
+              <dl>
+                <dt>Model</dt><dd>{upsStatus.model}</dd>
+                <dt>Status</dt><dd>{upsStatus.status}</dd>
+                <dt>Charge</dt><dd>{upsStatus.charge_percent ?? 'unknown'}%</dd>
+                <dt>Runtime</dt><dd>{runtimeLabel(upsStatus.runtime_seconds)}</dd>
+                <dt>Load</dt><dd>{upsStatus.load_percent ?? 'unknown'}%</dd>
+                <dt>Input</dt><dd>{upsStatus.input_voltage || 'unknown'}</dd>
+              </dl>
+            </div>
+          {:else}
+            <p class="empty">UPS status unavailable</p>
+          {/if}
+          <form class="inline ups-policy" on:submit|preventDefault={saveUpsPolicy}>
+            <label class="check"><input type="checkbox" bind:checked={upsPolicy.enabled} /> Policy enabled</label>
+            <input bind:value={upsPolicy.low_charge_percent} type="number" min="0" max="100" placeholder="low charge %" />
+            <input bind:value={upsPolicy.min_runtime_seconds} type="number" min="0" max="86400" placeholder="minimum runtime seconds" />
+            <input bind:value={upsPolicy.shutdown_command} placeholder="shutdown command" />
+            <button>Save UPS policy</button>
+          </form>
+        </section>
+        <section class="grid services-grid">
           {#each services as svc}
             <article class="card">
               <h2>{svc.label}</h2>

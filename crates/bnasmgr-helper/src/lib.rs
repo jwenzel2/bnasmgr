@@ -22,6 +22,9 @@ pub enum ServiceAction {
 #[serde(rename_all = "snake_case")]
 pub enum HelperOperation {
     ListStorage,
+    SystemReport,
+    ListNetworkInterfaces,
+    ListUpsStatus,
     ListSmartDisks,
     StartSmartTest {
         device: String,
@@ -272,6 +275,47 @@ impl HelperClient for MockHelper {
                         {"name":"tank/media","used":"820G","available":"5.4T","quota":"6T","reservation":null,"mountpoint":"/mnt/tank/media","compression":"lz4","atime":"off","health":"online","snapshots":12},
                         {"name":"tank/backups","used":"410G","available":"1.4T","quota":"2T","reservation":null,"mountpoint":"/mnt/tank/backups","compression":"zstd","atime":"off","health":"online","snapshots":31}
                     ]
+                }),
+            },
+            HelperOperation::SystemReport => HelperResponse {
+                ok: true,
+                category: "system_report".into(),
+                target: "localhost".into(),
+                message: "mock system report loaded".into(),
+                data: serde_json::json!({
+                    "hostname": "bnasmgr-mock",
+                    "os": "FreeBSD",
+                    "release": "14.2-RELEASE",
+                    "uptime_seconds": 86400,
+                    "memory_bytes": 17179869184u64,
+                    "load_average": [0.12, 0.18, 0.21]
+                }),
+            },
+            HelperOperation::ListNetworkInterfaces => HelperResponse {
+                ok: true,
+                category: "network".into(),
+                target: "interfaces".into(),
+                message: "mock network interfaces loaded".into(),
+                data: serde_json::json!([
+                    {"name":"em0","status":"active","mac":"02:00:00:00:00:01","ipv4":["192.168.1.50"],"ipv6":["fe80::1"],"mtu":1500},
+                    {"name":"lo0","status":"active","mac":null,"ipv4":["127.0.0.1"],"ipv6":["::1"],"mtu":16384}
+                ]),
+            },
+            HelperOperation::ListUpsStatus => HelperResponse {
+                ok: true,
+                category: "ups".into(),
+                target: "ups@localhost".into(),
+                message: "mock UPS status loaded".into(),
+                data: serde_json::json!({
+                    "name": "ups@localhost",
+                    "model": "Mock UPS 1500",
+                    "status": "OL",
+                    "state": "online",
+                    "charge_percent": 96,
+                    "runtime_seconds": 1840,
+                    "load_percent": 18,
+                    "input_voltage": "121.0",
+                    "battery_voltage": "27.2"
                 }),
             },
             HelperOperation::ListSmartDisks => HelperResponse {
@@ -710,6 +754,18 @@ impl FreeBsdCommandBuilder {
                 "-o".into(),
                 "name,used,avail,quota,reservation,mountpoint,compression,atime".into(),
             ],
+            HelperOperation::SystemReport => vec![
+                "sysctl".into(),
+                "-n".into(),
+                "kern.hostname".into(),
+                "kern.ostype".into(),
+                "kern.osrelease".into(),
+                "kern.boottime".into(),
+                "hw.physmem".into(),
+                "vm.loadavg".into(),
+            ],
+            HelperOperation::ListNetworkInterfaces => vec!["ifconfig".into(), "-a".into()],
+            HelperOperation::ListUpsStatus => vec!["upsc".into(), "ups@localhost".into()],
             HelperOperation::ListSmartDisks => vec!["smartctl".into(), "--scan".into()],
             HelperOperation::StartSmartTest {
                 device,
@@ -1230,6 +1286,9 @@ impl HelperClient for FreeBsdHelper {
         let operation = request.operation;
         match &operation {
             HelperOperation::ListStorage => return freebsd_storage_overview().await,
+            HelperOperation::SystemReport => return freebsd_system_report().await,
+            HelperOperation::ListNetworkInterfaces => return freebsd_network_interfaces().await,
+            HelperOperation::ListUpsStatus => return freebsd_ups_status().await,
             HelperOperation::ListSmartDisks => return freebsd_smart_disks().await,
             HelperOperation::ListSmartSelfTests { .. } => {
                 return freebsd_smart_self_tests(&operation).await
@@ -1406,6 +1465,72 @@ async fn freebsd_storage_overview() -> Result<HelperResponse, HelperError> {
             "pools": pool_rows,
             "datasets": dataset_rows,
         }),
+    })
+}
+
+async fn freebsd_system_report() -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(
+        &HelperOperation::SystemReport,
+    )?)
+    .await?;
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "system_report".into(),
+        target: "localhost".into(),
+        message: if output.ok {
+            "system report loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            parse_system_report(&output.stdout)
+        } else {
+            serde_json::json!({})
+        },
+    })
+}
+
+async fn freebsd_network_interfaces() -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(
+        &HelperOperation::ListNetworkInterfaces,
+    )?)
+    .await?;
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "network".into(),
+        target: "interfaces".into(),
+        message: if output.ok {
+            "network interfaces loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            serde_json::json!(parse_ifconfig_interfaces(&output.stdout))
+        } else {
+            serde_json::json!([])
+        },
+    })
+}
+
+async fn freebsd_ups_status() -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(
+        &HelperOperation::ListUpsStatus,
+    )?)
+    .await?;
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "ups".into(),
+        target: "ups@localhost".into(),
+        message: if output.ok {
+            "UPS status loaded".into()
+        } else {
+            output.stderr
+        },
+        data: if output.ok {
+            parse_upsc_status(&output.stdout)
+        } else {
+            serde_json::json!({})
+        },
     })
 }
 
@@ -2273,6 +2398,145 @@ fn parse_zpool_scrub_status(stdout: &str) -> serde_json::Value {
     })
 }
 
+fn parse_system_report(stdout: &str) -> serde_json::Value {
+    let mut lines = stdout.lines();
+    let hostname = lines.next().unwrap_or("unknown").trim();
+    let os = lines.next().unwrap_or("unknown").trim();
+    let release = lines.next().unwrap_or("unknown").trim();
+    let boottime = lines.next().unwrap_or("").trim();
+    let memory = lines
+        .next()
+        .unwrap_or("0")
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let load = lines.next().unwrap_or("").trim();
+    let boot_seconds = boottime
+        .split("sec =")
+        .nth(1)
+        .and_then(|value| value.split([',', '}']).next())
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    let uptime_seconds = boot_seconds
+        .and_then(|boot| Utc::now().timestamp().checked_sub(boot))
+        .filter(|value| *value >= 0)
+        .map(|value| value as u64);
+    let load_average = load
+        .trim_matches(|ch| ch == '{' || ch == '}')
+        .split_whitespace()
+        .filter_map(|value| value.parse::<f64>().ok())
+        .take(3)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "hostname": if hostname.is_empty() { "unknown" } else { hostname },
+        "os": if os.is_empty() { "unknown" } else { os },
+        "release": if release.is_empty() { "unknown" } else { release },
+        "uptime_seconds": uptime_seconds,
+        "memory_bytes": memory,
+        "load_average": load_average,
+    })
+}
+
+fn parse_ifconfig_interfaces(stdout: &str) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    let mut current: Option<BTreeMap<String, serde_json::Value>> = None;
+    for line in stdout.lines() {
+        if !line.starts_with(char::is_whitespace) && line.contains(':') {
+            if let Some(row) = current.take() {
+                rows.push(serde_json::json!(row));
+            }
+            let name = line.split(':').next().unwrap_or("unknown").trim();
+            let mut row = BTreeMap::new();
+            row.insert("name".into(), serde_json::json!(name));
+            row.insert("status".into(), serde_json::json!("unknown"));
+            row.insert("mac".into(), serde_json::Value::Null);
+            row.insert("ipv4".into(), serde_json::json!([]));
+            row.insert("ipv6".into(), serde_json::json!([]));
+            if let Some(mtu) = line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|pair| {
+                    (pair[0] == "mtu")
+                        .then(|| pair[1].parse::<u32>().ok())
+                        .flatten()
+                })
+            {
+                row.insert("mtu".into(), serde_json::json!(mtu));
+            } else {
+                row.insert("mtu".into(), serde_json::Value::Null);
+            }
+            current = Some(row);
+            continue;
+        }
+
+        let Some(row) = current.as_mut() else {
+            continue;
+        };
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("status:") {
+            row.insert("status".into(), serde_json::json!(value.trim()));
+        } else if let Some(value) = line.strip_prefix("ether ") {
+            row.insert("mac".into(), serde_json::json!(value.trim()));
+        } else if let Some(value) = line.strip_prefix("inet ") {
+            if let Some(address) = value.split_whitespace().next() {
+                if let Some(list) = row.get_mut("ipv4").and_then(|value| value.as_array_mut()) {
+                    list.push(serde_json::json!(address));
+                }
+            }
+        } else if let Some(value) = line.strip_prefix("inet6 ") {
+            if let Some(address) = value.split_whitespace().next() {
+                if let Some(list) = row.get_mut("ipv6").and_then(|value| value.as_array_mut()) {
+                    list.push(serde_json::json!(address));
+                }
+            }
+        }
+    }
+    if let Some(row) = current.take() {
+        rows.push(serde_json::json!(row));
+    }
+    rows
+}
+
+fn parse_upsc_status(stdout: &str) -> serde_json::Value {
+    let mut values = BTreeMap::new();
+    for line in stdout.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        values.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    let status = values
+        .get("ups.status")
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+    let state = if status.split_whitespace().any(|part| part == "LB") {
+        "low_battery"
+    } else if status.split_whitespace().any(|part| part == "OB") {
+        "on_battery"
+    } else if status.split_whitespace().any(|part| part == "OL") {
+        "online"
+    } else {
+        "unknown"
+    };
+    let model = values
+        .get("ups.model")
+        .or_else(|| values.get("device.model"))
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
+    serde_json::json!({
+        "name": "ups@localhost",
+        "model": model,
+        "manufacturer": values.get("device.mfr").cloned(),
+        "status": status,
+        "state": state,
+        "charge_percent": values.get("battery.charge").and_then(|value| value.parse::<u8>().ok()),
+        "runtime_seconds": values.get("battery.runtime").and_then(|value| value.parse::<u64>().ok()),
+        "load_percent": values.get("ups.load").and_then(|value| value.parse::<u8>().ok()),
+        "input_voltage": values.get("input.voltage").cloned(),
+        "battery_voltage": values.get("battery.voltage").cloned(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SmartDevice {
     name: String,
@@ -2763,6 +3027,9 @@ async fn freebsd_upsert_local_user(
 pub fn operation_category_target(operation: &HelperOperation) -> (String, String) {
     match operation {
         HelperOperation::ListStorage => ("storage".into(), "overview".into()),
+        HelperOperation::SystemReport => ("system_report".into(), "localhost".into()),
+        HelperOperation::ListNetworkInterfaces => ("network".into(), "interfaces".into()),
+        HelperOperation::ListUpsStatus => ("ups".into(), "ups@localhost".into()),
         HelperOperation::ListSmartDisks => ("disk_health".into(), "all".into()),
         HelperOperation::StartSmartTest { device, .. }
         | HelperOperation::ListSmartSelfTests { device, .. } => {
@@ -2953,6 +3220,66 @@ mod tests {
     fn smart_disk_scan_command_is_read_only() {
         let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ListSmartDisks).unwrap();
         assert_eq!(cmd, vec!["smartctl", "--scan"]);
+    }
+
+    #[test]
+    fn system_report_uses_read_only_sysctl_and_parses_output() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::SystemReport).unwrap();
+        assert_eq!(
+            cmd,
+            vec![
+                "sysctl",
+                "-n",
+                "kern.hostname",
+                "kern.ostype",
+                "kern.osrelease",
+                "kern.boottime",
+                "hw.physmem",
+                "vm.loadavg"
+            ]
+        );
+
+        let report = parse_system_report(
+            "nasbox\nFreeBSD\n14.2-RELEASE\n{ sec = 1710000000, usec = 0 } Fri Mar  9 10:00:00 2024\n17179869184\n{ 0.12 0.18 0.21 }\n",
+        );
+        assert_eq!(report["hostname"], "nasbox");
+        assert_eq!(report["os"], "FreeBSD");
+        assert_eq!(report["release"], "14.2-RELEASE");
+        assert_eq!(report["memory_bytes"], 17179869184u64);
+        assert_eq!(report["load_average"][0], 0.12);
+    }
+
+    #[test]
+    fn network_interfaces_use_read_only_ifconfig_and_parse_addresses() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ListNetworkInterfaces).unwrap();
+        assert_eq!(cmd, vec!["ifconfig", "-a"]);
+
+        let rows = parse_ifconfig_interfaces(
+            "em0: flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500\n\toptions=481249b<RXCSUM,TXCSUM,VLAN_MTU>\n\tether 02:00:00:00:00:01\n\tinet 192.168.1.50 netmask 0xffffff00 broadcast 192.168.1.255\n\tinet6 fe80::1%em0 prefixlen 64 scopeid 0x1\n\tstatus: active\nlo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> metric 0 mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\tinet6 ::1 prefixlen 128\n\tstatus: active\n",
+        );
+        assert_eq!(rows[0]["name"], "em0");
+        assert_eq!(rows[0]["status"], "active");
+        assert_eq!(rows[0]["mac"], "02:00:00:00:00:01");
+        assert_eq!(rows[0]["ipv4"][0], "192.168.1.50");
+        assert_eq!(rows[0]["ipv6"][0], "fe80::1%em0");
+        assert_eq!(rows[0]["mtu"], 1500);
+        assert_eq!(rows[1]["name"], "lo0");
+    }
+
+    #[test]
+    fn ups_status_uses_nut_upsc_and_parses_state() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ListUpsStatus).unwrap();
+        assert_eq!(cmd, vec!["upsc", "ups@localhost"]);
+
+        let status = parse_upsc_status(
+            "device.mfr: Example\nups.model: LinePower 1500\nups.status: OB LB\nbattery.charge: 12\nbattery.runtime: 140\nups.load: 37\ninput.voltage: 0.0\nbattery.voltage: 23.8\n",
+        );
+        assert_eq!(status["name"], "ups@localhost");
+        assert_eq!(status["model"], "LinePower 1500");
+        assert_eq!(status["state"], "low_battery");
+        assert_eq!(status["charge_percent"], 12);
+        assert_eq!(status["runtime_seconds"], 140);
+        assert_eq!(status["load_percent"], 37);
     }
 
     #[test]

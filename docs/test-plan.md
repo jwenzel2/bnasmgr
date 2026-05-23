@@ -6,8 +6,12 @@ Automated coverage in this MVP includes:
 - Helper-mediated Samba and NFS reload command construction.
 - FreeBSD `zpool`, `zfs snapshot`, and service-status output parsing.
 - Service allowlist enforcement and quota value validation.
+- System report command construction, sysctl output parsing, API exposure, and browser smoke coverage.
+- Network inventory command construction, ifconfig output parsing, API exposure, and browser smoke coverage.
 - Dataset create/update/delete command construction, property validation, and delete confirmation.
 - SMART disk inventory, self-test launch validation, and self-test history parsing.
+- UPS status command construction, NUT `upsc` output parsing, and API exposure.
+- UPS policy persistence, validation, alert threshold handling, and browser smoke coverage.
 - Computed alerts for failed helper operations and live NAS health signals.
 - Alert notification channel settings validation, persistence, and test audit events.
 - Background alert notification scan deduplication and delivery history.

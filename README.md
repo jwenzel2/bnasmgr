@@ -53,7 +53,11 @@ All routes are under `/api`:
 - `/api/auth/*`
 - `/api/config/export` and `/api/config/import` for operational configuration backup and restore
 - `/api/users` for listing, creating, deleting, role changes, and password resets
+- `/api/system/report` for read-only host, OS, uptime, memory, and load reporting
+- `/api/system/network` for read-only network interface inventory
 - `/api/system/users` and `/api/system/groups` for local Unix identity management
+- `/api/system/ups` for NUT UPS status monitoring
+- `/api/system/ups/policy` for low charge/runtime threshold policy settings
 - `/api/storage/*` including dataset create, property updates, delete, quota, and pool scrub controls
 - `/api/storage/disks/tests` for SMART self-test launch and history
 - `/api/snapshots/*`
@@ -74,7 +78,12 @@ The privileged boundary is represented by `bnasmgr-helper`. It accepts typed ope
 
 The FreeBSD helper adapter now normalizes `zpool`, `zfs`, `service`, and log output into the same JSON shape used by mock development mode, so the UI can switch adapters without changing API contracts.
 
+System reporting uses read-only `sysctl` values for hostname, OS release, boot time, physical memory, and load averages. Network inventory uses read-only `ifconfig -a` output.
+
 Service control is restricted to the NAS service allowlist. Dataset create/update/delete and quota changes are validated before reaching the helper; destructive dataset delete requires an `X-BNASMGR-CONFIRM` header matching the dataset name.
+
+UPS monitoring uses NUT's `upsc ups@localhost` command from the helper and normalizes line, battery, charge, runtime, and load fields for the dashboard.
+UPS policy settings are stored in operational configuration and can raise dashboard alerts when charge or runtime falls below configured thresholds; shutdown execution still requires host-side validation before relying on it in production.
 
 Local Unix users/groups and Samba storage users are managed separately from dashboard users. Local and Samba passwords are sent to the helper over the local socket and are redacted from helper history.
 

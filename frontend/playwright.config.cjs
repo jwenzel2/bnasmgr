@@ -1,10 +1,10 @@
-import { defineConfig, devices } from '@playwright/test';
+const { defineConfig, devices } = require('@playwright/test');
 
 const apiPort = 18080;
 const webPort = 15173;
 const apiOrigin = `http://127.0.0.1:${apiPort}`;
 
-export default defineConfig({
+module.exports = defineConfig({
   testDir: './tests/e2e',
   timeout: 30_000,
   fullyParallel: false,

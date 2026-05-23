@@ -346,6 +346,13 @@ pub fn app_with_static_dir(state: AppState, static_dir: Option<PathBuf>) -> Rout
             get(list_local_groups).post(upsert_local_group),
         )
         .route("/api/system/groups/:name", delete(delete_local_group))
+        .route("/api/system/ups", get(ups_status))
+        .route(
+            "/api/system/ups/policy",
+            get(get_ups_policy).post(save_ups_policy),
+        )
+        .route("/api/system/report", get(system_report))
+        .route("/api/system/network", get(network_interfaces))
         .route("/api/storage/overview", get(storage_overview))
         .route("/api/storage/datasets", post(create_dataset))
         .route("/api/storage/datasets/properties", post(update_dataset))
@@ -1089,6 +1096,18 @@ struct AlertNotificationSettings {
     smtp_password: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct UpsPolicySettings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_ups_low_charge_percent")]
+    low_charge_percent: u8,
+    #[serde(default = "default_ups_min_runtime_seconds")]
+    min_runtime_seconds: u64,
+    #[serde(default = "default_ups_shutdown_command")]
+    shutdown_command: String,
+}
+
 #[derive(Serialize)]
 struct AlertNotificationHistoryItem {
     channel: String,
@@ -1097,6 +1116,29 @@ struct AlertNotificationHistoryItem {
     message: String,
     result: String,
     created_at: String,
+}
+
+impl Default for UpsPolicySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            low_charge_percent: default_ups_low_charge_percent(),
+            min_runtime_seconds: default_ups_min_runtime_seconds(),
+            shutdown_command: default_ups_shutdown_command(),
+        }
+    }
+}
+
+fn default_ups_low_charge_percent() -> u8 {
+    20
+}
+
+fn default_ups_min_runtime_seconds() -> u64 {
+    300
+}
+
+fn default_ups_shutdown_command() -> String {
+    "shutdown -p now".into()
 }
 
 impl Default for AlertNotificationSettings {
@@ -1628,6 +1670,102 @@ async fn list_local_users(
             .helper(&user.username, HelperOperation::ListLocalUsers)
             .await?,
     ))
+}
+
+async fn ups_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::ListUpsStatus)
+            .await?,
+    ))
+}
+
+async fn system_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::SystemReport)
+            .await?,
+    ))
+}
+
+async fn network_interfaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    Ok(Json(
+        state
+            .helper(&user.username, HelperOperation::ListNetworkInterfaces)
+            .await?,
+    ))
+}
+
+fn validate_ups_policy(settings: &UpsPolicySettings) -> Result<(), ApiError> {
+    if settings.low_charge_percent > 100 {
+        return Err(ApiError::bad_request(
+            "UPS low charge threshold must be between 0 and 100",
+        ));
+    }
+    if settings.min_runtime_seconds > 86_400 {
+        return Err(ApiError::bad_request(
+            "UPS minimum runtime must be 86400 seconds or less",
+        ));
+    }
+    if settings.shutdown_command.len() > 200 {
+        return Err(ApiError::bad_request("UPS shutdown command is too long"));
+    }
+    if settings.enabled || !settings.shutdown_command.trim().is_empty() {
+        reject_shell_chars(&settings.shutdown_command, "UPS shutdown command")?;
+    }
+    Ok(())
+}
+
+async fn load_ups_policy(state: &AppState) -> Result<UpsPolicySettings, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("select value from app_settings where key = 'ups_policy'")
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+async fn get_ups_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<UpsPolicySettings>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(load_ups_policy(&state).await?))
+}
+
+async fn save_ups_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<UpsPolicySettings>,
+) -> Result<Json<UpsPolicySettings>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_ups_policy(&settings)?;
+    sqlx::query(
+        "insert into app_settings (key, value) values ('ups_policy', ?)
+         on conflict(key) do update set value = excluded.value",
+    )
+    .bind(serde_json::to_string(&settings).map_err(|err| ApiError::internal(err.to_string()))?)
+    .execute(&state.db)
+    .await?;
+    state
+        .audit(&user.username, "ups", "policy", "ok", "UPS policy saved")
+        .await?;
+    Ok(Json(settings))
 }
 
 async fn upsert_local_user(
@@ -3577,6 +3715,56 @@ async fn compute_alerts(state: &AppState, actor: &str) -> Result<Vec<AlertItem>,
         }
     }
 
+    if let Ok(ups) = helper_probe(state, actor, HelperOperation::ListUpsStatus).await {
+        let policy = load_ups_policy(state).await.unwrap_or_default();
+        let ups_state = ups
+            .get("state")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        if ups_state != "online" && ups_state != "unknown" {
+            items.push(alert(
+                if ups_state == "low_battery" {
+                    "critical"
+                } else {
+                    "warning"
+                },
+                "ups",
+                ups.get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("ups@localhost"),
+                format!("UPS state is {ups_state}"),
+            ));
+        }
+        if policy.enabled {
+            if let Some(charge) = ups.get("charge_percent").and_then(|value| value.as_u64()) {
+                if charge <= u64::from(policy.low_charge_percent) {
+                    items.push(alert(
+                        "critical",
+                        "ups",
+                        "charge",
+                        format!(
+                            "UPS charge is {charge}% at or below {}%",
+                            policy.low_charge_percent
+                        ),
+                    ));
+                }
+            }
+            if let Some(runtime) = ups.get("runtime_seconds").and_then(|value| value.as_u64()) {
+                if runtime <= policy.min_runtime_seconds {
+                    items.push(alert(
+                        "critical",
+                        "ups",
+                        "runtime",
+                        format!(
+                            "UPS runtime is {runtime}s at or below {}s",
+                            policy.min_runtime_seconds
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     for service in [
         "zfs",
         "samba_server",
@@ -5026,6 +5214,141 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let disks: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(disks[0]["state"], "ok");
+    }
+
+    #[tokio::test]
+    async fn ups_status_is_exposed_to_authenticated_users() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/ups")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["state"], "online");
+        assert_eq!(status["charge_percent"], 96);
+    }
+
+    #[tokio::test]
+    async fn system_report_is_exposed_to_authenticated_users() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/report")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["hostname"], "bnasmgr-mock");
+        assert_eq!(report["os"], "FreeBSD");
+        assert_eq!(report["load_average"][0], 0.12);
+    }
+
+    #[tokio::test]
+    async fn network_interfaces_are_exposed_to_authenticated_users() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/network")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let interfaces: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(interfaces[0]["name"], "em0");
+        assert_eq!(interfaces[0]["ipv4"][0], "192.168.1.50");
+    }
+
+    #[tokio::test]
+    async fn ups_policy_is_admin_managed_and_feeds_alerts() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/ups/policy")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"enabled":true,"low_charge_percent":99,"min_runtime_seconds":2000,"shutdown_command":"shutdown -p now"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/ups/policy")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settings["enabled"], true);
+        assert_eq!(settings["low_charge_percent"], 99);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/alerts")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let alerts: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(alerts
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["category"] == "ups" && item["target"] == "charge" }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/ups/policy")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"enabled":true,"low_charge_percent":101,"min_runtime_seconds":300,"shutdown_command":"shutdown -p now"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

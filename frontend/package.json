@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test:e2e": "playwright test"
+    "test:e2e": "PW_DISABLE_TS_ESM=1 playwright test -c playwright.config.cjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",

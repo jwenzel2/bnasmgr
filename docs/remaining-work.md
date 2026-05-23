@@ -15,7 +15,11 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - Typed helper protocol over a Unix socket, with mock and FreeBSD backends.
 - FreeBSD command construction/parsing for ZFS storage, snapshots, quotas, services, logs, Samba users, and Samba/NFS/iSCSI fragment application.
 - Dataset create, property update, and delete workflows for compression, atime, quota, reservation, and mountpoint controls.
+- Read-only system reporting for host, OS, uptime, memory, and load averages.
+- Read-only network interface inventory for status, addresses, MAC, and MTU.
 - Service monitoring/control for `zfs`, `samba_server`, `nfsd`, `mountd`, `rpcbind`, `ctld`, and `syslogd`.
+- UPS status monitoring through NUT `upsc ups@localhost`.
+- UPS policy settings for low charge/runtime thresholds and intended shutdown command.
 - Pool scrub status plus start/stop controls.
 - SMART disk health inventory with self-test launch and history.
 - Computed alerts for degraded pools, unhealthy disks, stopped services, and failed helper operations.
@@ -35,7 +39,7 @@ The next implementation track is modeled after common TrueNAS-style NAS administ
 
 - Scheduled snapshot tasks with cadence and retention metadata.
 - Directory service integration.
-- UPS integration, network configuration, directory service integration, and system reporting.
+- UPS shutdown execution integration, network configuration writes, directory service integration, and deeper system reporting.
 
 ## Verification Commands
 
