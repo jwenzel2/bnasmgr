@@ -55,9 +55,14 @@ All routes are under `/api`:
 - `/api/users` for listing, creating, deleting, role changes, and password resets
 - `/api/system/report` for read-only host, OS, uptime, memory, and load reporting
 - `/api/system/network` for read-only network interface inventory
+- `/api/system/network/config` for DHCP/static IPv4 interface configuration
+- `/api/system/network/dns` for resolver nameserver and search domain configuration
+- `/api/system/network/routes` for static route configuration
 - `/api/system/users` and `/api/system/groups` for local Unix identity management
 - `/api/system/ups` for NUT UPS status monitoring
 - `/api/system/ups/policy` for low charge/runtime threshold policy settings
+- `/api/system/ups/shutdown` for confirmed execution of the configured UPS shutdown command
+- `/api/system/directory-service` for LDAP/Active Directory connection settings
 - `/api/storage/*` including dataset create, property updates, delete, quota, and pool scrub controls
 - `/api/storage/disks/tests` for SMART self-test launch and history
 - `/api/snapshots/*`
@@ -78,12 +83,14 @@ The privileged boundary is represented by `bnasmgr-helper`. It accepts typed ope
 
 The FreeBSD helper adapter now normalizes `zpool`, `zfs`, `service`, and log output into the same JSON shape used by mock development mode, so the UI can switch adapters without changing API contracts.
 
-System reporting uses read-only `sysctl` values for hostname, OS release, boot time, physical memory, and load averages. Network inventory uses read-only `ifconfig -a` output.
+System reporting uses read-only `sysctl` values for hostname, OS release, boot time, CPU model/core count, physical/free memory, swap total, and load averages. Network inventory uses read-only `ifconfig -a` output. Network configuration writes persist dashboard intent, apply DHCP/static IPv4 settings with `sysrc ifconfig_<iface>=...`, restart the target interface through `service netif restart <iface>`, write validated resolver settings to `/etc/resolv.conf`, and manage static route rc.conf entries before restarting routing.
 
 Service control is restricted to the NAS service allowlist. Dataset create/update/delete and quota changes are validated before reaching the helper; destructive dataset delete requires an `X-BNASMGR-CONFIRM` header matching the dataset name.
 
 UPS monitoring uses NUT's `upsc ups@localhost` command from the helper and normalizes line, battery, charge, runtime, and load fields for the dashboard.
-UPS policy settings are stored in operational configuration and can raise dashboard alerts when charge or runtime falls below configured thresholds; shutdown execution still requires host-side validation before relying on it in production.
+UPS policy settings are stored in operational configuration and can raise dashboard alerts when charge or runtime falls below configured thresholds. Confirmed shutdown execution runs through the helper and only accepts `shutdown -p now`, `shutdown -h now`, or `shutdown -p|-h +minutes` up to 1440 minutes.
+
+Directory service settings store LDAP or Active Directory connection metadata, validate required fields and LDAP URI schemes, and apply through the typed helper boundary. The FreeBSD helper renders `/usr/local/etc/nslcd.conf` before restarting `nslcd`; override the target path with `BNASMGR_NSLCD_CONF` for staged validation. NSS/PAM and domain join wiring still need target-host validation before relying on directory logins.
 
 Local Unix users/groups and Samba storage users are managed separately from dashboard users. Local and Samba passwords are sent to the helper over the local socket and are redacted from helper history.
 

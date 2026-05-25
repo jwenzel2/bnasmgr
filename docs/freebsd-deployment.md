@@ -203,11 +203,17 @@ Snapshot delete and rollback also require `X-BNASMGR-CONFIRM` to exactly match t
 
 File-level snapshot restore uses the dataset snapshot mount at `<mountpoint>/.zfs/snapshot/<snapshot-name>` and copies selected relative file paths back into the live dataset. It does not roll back the entire dataset. Restore requests still require `X-BNASMGR-CONFIRM` because existing live files can be overwritten.
 
+UPS shutdown execution requires the dashboard policy to be enabled and an exact `X-BNASMGR-CONFIRM: EXECUTE UPS SHUTDOWN` header. The helper accepts only `shutdown -p now`, `shutdown -h now`, or `shutdown -p|-h +minutes` up to 1440 minutes.
+
+Network configuration writes use `sysrc ifconfig_<iface>=...` for DHCP/static IPv4 settings, optionally update `defaultrouter`, then restart the target interface with `service netif restart <iface>`. DNS resolver writes render validated nameserver/search-domain settings to `/etc/resolv.conf`; override the target path with `BNASMGR_RESOLV_CONF` in the helper environment for staged validation. Static routes are written through `static_routes` and `route_*` rc.conf entries before `service routing restart`. Validate these workflows from console access on the target host before managing the active administrative interface.
+
 Dashboard users are separate from FreeBSD users and Samba users. Use dashboard users only for web access; use the local identity and Samba user panels for storage identities.
 
 Dashboard admins can create users, promote/demote roles, reset temporary passwords, and delete other dashboard users. The API prevents deleting your own account and prevents deleting or demoting the last remaining dashboard admin.
 
 Local Unix users and groups are managed through `pw` helper operations. Samba users are storage identities, not dashboard identities. The dashboard can set or rotate a Samba password through `smbpasswd -a -s`, enable/disable the user, and delete the Samba account through `pdbedit -x -u`. Passwords are provided through stdin and are redacted from helper history before the operation is persisted.
+
+Directory service settings capture LDAP or Active Directory connection metadata, render `/usr/local/etc/nslcd.conf`, and restart `nslcd` through the helper after saving. Override the rendered config path with `BNASMGR_NSLCD_CONF` for staged validation. Before relying on directory-backed identity lookup, wire and validate the target host's NSS/PAM settings, certificate trust, and any Active Directory join steps outside the dashboard.
 
 Configuration backup/export covers saved dashboard operational state only. It excludes sessions, audit/helper history, notification delivery attempts, and dashboard password hashes. SMTP passwords are redacted from exported alert notification settings and must be re-entered after restore if email delivery uses authentication.
 

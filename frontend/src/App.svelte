@@ -16,8 +16,12 @@
   let services = [];
   let systemReport = null;
   let networkInterfaces = [];
+  let networkConfigs = [];
+  let dnsConfig = { nameservers: [], search_domains: [] };
+  let staticRoutes = [];
   let upsStatus = null;
   let upsPolicy = { enabled: false, low_charge_percent: 20, min_runtime_seconds: 300, shutdown_command: 'shutdown -p now' };
+  let directoryService = { enabled: false, provider: 'ldap', domain: '', uri: '', base_dn: '', bind_dn: '', tls: true };
   let sambaShares = [];
   let sambaSettings = { workgroup: 'WORKGROUP', server_string: 'bnasmgr NAS', netbios_name: 'BNASMGR', security: 'user', map_to_guest: 'Bad User', log_level: '1' };
   let sambaUsers = [];
@@ -51,6 +55,9 @@
   let localUserForm = { username: '', full_name: '', shell: '/bin/sh', home: '', groups: '', password: '', create_home: true };
   let localGroupForm = { name: '', members: '' };
   let logFilters = { service: '', severity: '', search: '', from: '', to: '' };
+  let networkConfigForm = { name: 'em0', mode: 'dhcp', ipv4_address: '', netmask: '255.255.255.0', gateway: '' };
+  let dnsConfigForm = { nameservers: '1.1.1.1, 8.8.8.8', search_domains: 'lan' };
+  let staticRouteForm = { destination: '10.0.0.0/24', gateway: '192.168.1.1', description: '' };
   let configBackupText = '';
   let configImportReplace = false;
 
@@ -84,7 +91,7 @@
 
   async function loadAll() {
     if (!token || user?.must_change_password) return;
-    await Promise.all([loadStorage(), loadDiskHealth(), loadSnapshots(), loadSnapshotTasks(), loadReplicationTasks(), loadServices(), loadSystemReport(), loadNetworkInterfaces(), loadUpsStatus(), loadUpsPolicy(), loadShares(), loadAlerts(), loadAlertNotifications(), loadAlertNotificationHistory(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
+    await Promise.all([loadStorage(), loadDiskHealth(), loadSnapshots(), loadSnapshotTasks(), loadReplicationTasks(), loadServices(), loadSystemReport(), loadNetworkInterfaces(), loadNetworkConfigs(), loadDnsConfig(), loadStaticRoutes(), loadUpsStatus(), loadUpsPolicy(), loadDirectoryService(), loadShares(), loadAlerts(), loadAlertNotifications(), loadAlertNotificationHistory(), loadLogs(), loadAudit(), loadHelperHistory(), loadUsers()]);
   }
 
   async function restoreSession() {
@@ -335,6 +342,54 @@
     }
   }
 
+  async function loadNetworkConfigs() {
+    networkConfigs = await request('/api/system/network/config');
+  }
+
+  async function saveNetworkConfig() {
+    networkConfigs = await request('/api/system/network/config', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...networkConfigForm,
+        ipv4_address: networkConfigForm.mode === 'static' ? networkConfigForm.ipv4_address : '',
+        netmask: networkConfigForm.mode === 'static' ? networkConfigForm.netmask : '',
+        gateway: networkConfigForm.gateway
+      })
+    });
+    await Promise.all([loadNetworkInterfaces(), loadAudit(), loadHelperHistory()]);
+  }
+
+  async function loadDnsConfig() {
+    dnsConfig = await request('/api/system/network/dns');
+    dnsConfigForm = {
+      nameservers: Array.isArray(dnsConfig.nameservers) ? dnsConfig.nameservers.join(', ') : '',
+      search_domains: Array.isArray(dnsConfig.search_domains) ? dnsConfig.search_domains.join(', ') : ''
+    };
+  }
+
+  async function saveDnsConfig() {
+    dnsConfig = await request('/api/system/network/dns', {
+      method: 'POST',
+      body: JSON.stringify({
+        nameservers: dnsConfigForm.nameservers.split(',').map((item) => item.trim()).filter(Boolean),
+        search_domains: dnsConfigForm.search_domains.split(',').map((item) => item.trim()).filter(Boolean)
+      })
+    });
+    await Promise.all([loadAudit(), loadHelperHistory()]);
+  }
+
+  async function loadStaticRoutes() {
+    staticRoutes = await request('/api/system/network/routes');
+  }
+
+  async function saveStaticRoute() {
+    staticRoutes = await request('/api/system/network/routes', {
+      method: 'POST',
+      body: JSON.stringify(staticRouteForm)
+    });
+    await Promise.all([loadAudit(), loadHelperHistory()]);
+  }
+
   async function loadUpsStatus() {
     try {
       upsStatus = await request('/api/system/ups');
@@ -357,6 +412,29 @@
       })
     });
     await loadAlerts();
+  }
+
+  async function executeUpsShutdown() {
+    const confirmed = prompt('Type EXECUTE UPS SHUTDOWN to run the configured shutdown command');
+    if (confirmed !== 'EXECUTE UPS SHUTDOWN') return;
+    await request('/api/system/ups/shutdown', {
+      method: 'POST',
+      headers: { 'x-bnasmgr-confirm': 'EXECUTE UPS SHUTDOWN' },
+      body: JSON.stringify({})
+    });
+    await loadAudit();
+    await loadHelperHistory();
+  }
+
+  async function loadDirectoryService() {
+    directoryService = await request('/api/system/directory-service');
+  }
+
+  async function saveDirectoryService() {
+    directoryService = await request('/api/system/directory-service', {
+      method: 'POST',
+      body: JSON.stringify(directoryService)
+    });
   }
 
   async function serviceAction(service, action) {
@@ -996,7 +1074,11 @@
               <dt>Host</dt><dd>{systemReport.hostname}</dd>
               <dt>OS</dt><dd>{systemReport.os} {systemReport.release}</dd>
               <dt>Uptime</dt><dd>{runtimeLabel(systemReport.uptime_seconds)}</dd>
+              <dt>CPU</dt><dd>{systemReport.cpu_model || 'unknown'}</dd>
+              <dt>Cores</dt><dd>{systemReport.cpu_cores || 'unknown'}</dd>
               <dt>Memory</dt><dd>{bytesLabel(systemReport.memory_bytes)}</dd>
+              <dt>Free memory</dt><dd>{bytesLabel(systemReport.memory_free_bytes)}</dd>
+              <dt>Swap</dt><dd>{bytesLabel(systemReport.swap_total_bytes)}</dd>
               <dt>Load</dt><dd>{Array.isArray(systemReport.load_average) ? systemReport.load_average.join(', ') : 'unknown'}</dd>
             </dl>
           {:else}
@@ -1026,6 +1108,67 @@
           {:else}
             <p class="empty">No network interfaces loaded</p>
           {/if}
+          <form class="inline network-config" on:submit|preventDefault={saveNetworkConfig}>
+            <input bind:value={networkConfigForm.name} placeholder="interface" />
+            <select bind:value={networkConfigForm.mode}>
+              <option value="dhcp">DHCP</option>
+              <option value="static">Static IPv4</option>
+            </select>
+            <input bind:value={networkConfigForm.ipv4_address} disabled={networkConfigForm.mode !== 'static'} placeholder="IPv4 address" />
+            <input bind:value={networkConfigForm.netmask} disabled={networkConfigForm.mode !== 'static'} placeholder="netmask" />
+            <input bind:value={networkConfigForm.gateway} placeholder="default gateway, optional" />
+            <button>Apply network config</button>
+          </form>
+          {#if networkConfigs.length}
+            <table>
+              <tbody>
+                {#each networkConfigs as config}
+                  <tr>
+                    <td>{config.name}</td>
+                    <td>{config.mode}</td>
+                    <td>{config.ipv4_address || '-'}</td>
+                    <td>{config.netmask || '-'}</td>
+                    <td>{config.gateway || '-'}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+          <form class="inline network-config" on:submit|preventDefault={saveDnsConfig}>
+            <input bind:value={dnsConfigForm.nameservers} placeholder="DNS nameservers" />
+            <input bind:value={dnsConfigForm.search_domains} placeholder="search domains, optional" />
+            <button>Apply DNS config</button>
+          </form>
+          {#if Array.isArray(dnsConfig.nameservers) && dnsConfig.nameservers.length}
+            <table>
+              <tbody>
+                <tr>
+                  <td>DNS</td>
+                  <td>{dnsConfig.nameservers.join(', ')}</td>
+                  <td>{Array.isArray(dnsConfig.search_domains) && dnsConfig.search_domains.length ? dnsConfig.search_domains.join(', ') : '-'}</td>
+                </tr>
+              </tbody>
+            </table>
+          {/if}
+          <form class="inline network-config" on:submit|preventDefault={saveStaticRoute}>
+            <input bind:value={staticRouteForm.destination} placeholder="route destination" />
+            <input bind:value={staticRouteForm.gateway} placeholder="route gateway" />
+            <input bind:value={staticRouteForm.description} placeholder="route description, optional" />
+            <button>Apply static route</button>
+          </form>
+          {#if staticRoutes.length}
+            <table>
+              <tbody>
+                {#each staticRoutes as route}
+                  <tr>
+                    <td>{route.destination}</td>
+                    <td>{route.gateway}</td>
+                    <td>{route.description || '-'}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
         </section>
         <section class="panel">
           <div class="toolbar">
@@ -1053,6 +1196,28 @@
             <input bind:value={upsPolicy.min_runtime_seconds} type="number" min="0" max="86400" placeholder="minimum runtime seconds" />
             <input bind:value={upsPolicy.shutdown_command} placeholder="shutdown command" />
             <button>Save UPS policy</button>
+          </form>
+          <div class="actions">
+            <button disabled={!upsPolicy.enabled} on:click={executeUpsShutdown}>Execute UPS shutdown</button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="toolbar">
+            <h2>Directory service</h2>
+            <button on:click={loadDirectoryService}>Refresh</button>
+          </div>
+          <form class="stack directory-form" on:submit|preventDefault={saveDirectoryService}>
+            <label class="check"><input type="checkbox" bind:checked={directoryService.enabled} /> Enabled</label>
+            <select bind:value={directoryService.provider}>
+              <option value="ldap">LDAP</option>
+              <option value="active_directory">Active Directory</option>
+            </select>
+            <input bind:value={directoryService.domain} placeholder="directory domain" />
+            <input bind:value={directoryService.uri} placeholder="ldap://directory.example.test" />
+            <input bind:value={directoryService.base_dn} placeholder="dc=example,dc=test" />
+            <input bind:value={directoryService.bind_dn} placeholder="bind DN, optional" />
+            <label class="check"><input type="checkbox" bind:checked={directoryService.tls} /> TLS required</label>
+            <button>Save directory service</button>
           </form>
         </section>
         <section class="grid services-grid">

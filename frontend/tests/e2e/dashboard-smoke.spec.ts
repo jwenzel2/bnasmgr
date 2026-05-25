@@ -75,9 +75,41 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
   await expect(page.locator('main > header h1')).toHaveText('services');
   await expect(page.getByRole('heading', { name: 'System', exact: true })).toBeVisible();
   await expect(page.getByText('bnasmgr-mock')).toBeVisible();
+  await expect(page.getByText('Mock CPU')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Network' })).toBeVisible();
   await expect(page.getByRole('cell', { name: 'em0' })).toBeVisible();
   await expect(page.getByRole('cell', { name: '192.168.1.50' })).toBeVisible();
+  const networkConfigForm = page.locator('form').filter({ has: page.getByRole('button', { name: 'Apply network config' }) });
+  await networkConfigForm.getByPlaceholder('interface').fill('em0');
+  await networkConfigForm.getByRole('combobox').selectOption('static');
+  await networkConfigForm.getByPlaceholder('IPv4 address').fill('192.168.1.60');
+  await networkConfigForm.getByPlaceholder('netmask').fill('255.255.255.0');
+  await networkConfigForm.getByPlaceholder('default gateway, optional').fill('192.168.1.1');
+  const saveNetworkResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/network/config') && response.request().method() === 'POST'
+  );
+  await networkConfigForm.getByRole('button', { name: 'Apply network config' }).click();
+  await expect((await saveNetworkResponse).ok()).toBeTruthy();
+  await expect(page.getByRole('cell', { name: '192.168.1.60' })).toBeVisible();
+  const dnsConfigForm = page.locator('form').filter({ has: page.getByRole('button', { name: 'Apply DNS config' }) });
+  await dnsConfigForm.getByPlaceholder('DNS nameservers').fill('1.1.1.1, 8.8.8.8');
+  await dnsConfigForm.getByPlaceholder('search domains, optional').fill('lan, example.test');
+  const saveDnsResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/network/dns') && response.request().method() === 'POST'
+  );
+  await dnsConfigForm.getByRole('button', { name: 'Apply DNS config' }).click();
+  await expect((await saveDnsResponse).ok()).toBeTruthy();
+  await expect(page.getByRole('cell', { name: '1.1.1.1, 8.8.8.8' })).toBeVisible();
+  const staticRouteForm = page.locator('form').filter({ has: page.getByRole('button', { name: 'Apply static route' }) });
+  await staticRouteForm.getByPlaceholder('route destination').fill('10.10.0.0/16');
+  await staticRouteForm.getByPlaceholder('route gateway').fill('192.168.1.1');
+  await staticRouteForm.getByPlaceholder('route description, optional').fill('lab route');
+  const saveRouteResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/network/routes') && response.request().method() === 'POST'
+  );
+  await staticRouteForm.getByRole('button', { name: 'Apply static route' }).click();
+  await expect((await saveRouteResponse).ok()).toBeTruthy();
+  await expect(page.getByRole('cell', { name: '10.10.0.0/16' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'UPS' })).toBeVisible();
   await expect(page.getByText('Mock UPS 1500')).toBeVisible();
   const upsPolicyForm = page.locator('form').filter({ has: page.getByRole('button', { name: 'Save UPS policy' }) });
@@ -85,6 +117,25 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
   await upsPolicyForm.getByPlaceholder('low charge %').fill('25');
   await upsPolicyForm.getByPlaceholder('minimum runtime seconds').fill('600');
   await upsPolicyForm.getByRole('button', { name: 'Save UPS policy' }).click();
+  page.once('dialog', (dialog) => dialog.accept('wrong-confirmation'));
+  await page.getByRole('button', { name: 'Execute UPS shutdown' }).click();
+  page.once('dialog', (dialog) => dialog.accept('EXECUTE UPS SHUTDOWN'));
+  const executeUpsShutdownResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/ups/shutdown') && response.request().method() === 'POST'
+  );
+  await page.getByRole('button', { name: 'Execute UPS shutdown' }).click();
+  await expect((await executeUpsShutdownResponse).ok()).toBeTruthy();
+  const directoryForm = page.locator('form').filter({ has: page.getByRole('button', { name: 'Save directory service' }) });
+  await directoryForm.getByLabel('Enabled').check();
+  await directoryForm.getByPlaceholder('directory domain').fill('example.test');
+  await directoryForm.getByPlaceholder('ldap://directory.example.test').fill('ldaps://directory.example.test');
+  await directoryForm.getByPlaceholder('dc=example,dc=test').fill('dc=example,dc=test');
+  await directoryForm.getByPlaceholder('bind DN, optional').fill('cn=readonly,dc=example,dc=test');
+  const saveDirectoryResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/directory-service') && response.request().method() === 'POST'
+  );
+  await directoryForm.getByRole('button', { name: 'Save directory service' }).click();
+  await expect((await saveDirectoryResponse).ok()).toBeTruthy();
   const sambaServiceCard = page.locator('article.card').filter({ has: page.getByRole('heading', { name: 'Samba', exact: true }) });
   await expect(sambaServiceCard).toContainText('running');
   await sambaServiceCard.getByRole('button', { name: 'Restart' }).click();
@@ -166,6 +217,10 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
   await page.getByRole('button', { name: 'Import' }).click();
   await expect(configBackup).toHaveValue(/"version": 1/);
   await expect(configBackup).toHaveValue(/ups_policy/);
+  await expect(configBackup).toHaveValue(/network_config/);
+  await expect(configBackup).toHaveValue(/network_dns/);
+  await expect(configBackup).toHaveValue(/network_routes/);
+  await expect(configBackup).toHaveValue(/directory_service/);
 
   await page.getByRole('button', { name: 'shares' }).click();
   page.once('dialog', (dialog) => dialog.accept());
@@ -206,6 +261,11 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
   await expect(page.getByText('nfs export saved')).toBeVisible();
   await expect(page.getByText('iSCSI target saved')).toBeVisible();
   await expect(page.getByRole('cell', { name: 'alert notification settings saved' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'UPS shutdown command executed' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'network interface configuration saved' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'DNS resolver configuration saved' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'static route configuration saved' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'directory service settings saved' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'alert notification test queued for 1 channel(s)' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'configuration backup imported' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'samba share deleted' }).first()).toBeVisible();

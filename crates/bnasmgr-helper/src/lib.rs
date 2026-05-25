@@ -24,7 +24,33 @@ pub enum HelperOperation {
     ListStorage,
     SystemReport,
     ListNetworkInterfaces,
+    ApplyNetworkInterfaceConfig {
+        name: String,
+        mode: String,
+        ipv4_address: Option<String>,
+        netmask: Option<String>,
+        gateway: Option<String>,
+    },
+    ApplyDnsResolverConfig {
+        nameservers: Vec<String>,
+        search_domains: Vec<String>,
+    },
+    ApplyStaticRoutesConfig {
+        routes: Vec<StaticRouteConfig>,
+    },
     ListUpsStatus,
+    ExecuteUpsShutdown {
+        command: String,
+    },
+    ApplyDirectoryServiceSettings {
+        enabled: bool,
+        provider: String,
+        domain: String,
+        uri: String,
+        base_dn: String,
+        bind_dn: Option<String>,
+        tls: bool,
+    },
     ListSmartDisks,
     StartSmartTest {
         device: String,
@@ -209,6 +235,13 @@ pub struct HelperResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StaticRouteConfig {
+    pub destination: String,
+    pub gateway: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageDataset {
     pub name: String,
     pub used: String,
@@ -287,7 +320,11 @@ impl HelperClient for MockHelper {
                     "os": "FreeBSD",
                     "release": "14.2-RELEASE",
                     "uptime_seconds": 86400,
+                    "cpu_model": "Mock CPU",
+                    "cpu_cores": 8,
                     "memory_bytes": 17179869184u64,
+                    "memory_free_bytes": 8589934592u64,
+                    "swap_total_bytes": 4294967296u64,
                     "load_average": [0.12, 0.18, 0.21]
                 }),
             },
@@ -300,6 +337,33 @@ impl HelperClient for MockHelper {
                     {"name":"em0","status":"active","mac":"02:00:00:00:00:01","ipv4":["192.168.1.50"],"ipv6":["fe80::1"],"mtu":1500},
                     {"name":"lo0","status":"active","mac":null,"ipv4":["127.0.0.1"],"ipv6":["::1"],"mtu":16384}
                 ]),
+            },
+            HelperOperation::ApplyNetworkInterfaceConfig { name, mode, .. } => HelperResponse {
+                ok: true,
+                category: "network_config".into(),
+                target: name,
+                message: format!("mock network interface set to {mode}"),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::ApplyDnsResolverConfig {
+                nameservers,
+                search_domains,
+            } => HelperResponse {
+                ok: true,
+                category: "network_dns".into(),
+                target: "resolver".into(),
+                message: "mock DNS resolver settings applied".into(),
+                data: serde_json::json!({
+                    "nameservers": nameservers,
+                    "search_domains": search_domains,
+                }),
+            },
+            HelperOperation::ApplyStaticRoutesConfig { routes } => HelperResponse {
+                ok: true,
+                category: "network_routes".into(),
+                target: "static".into(),
+                message: "mock static routes applied".into(),
+                data: serde_json::json!({ "routes": routes }),
             },
             HelperOperation::ListUpsStatus => HelperResponse {
                 ok: true,
@@ -316,6 +380,34 @@ impl HelperClient for MockHelper {
                     "load_percent": 18,
                     "input_voltage": "121.0",
                     "battery_voltage": "27.2"
+                }),
+            },
+            HelperOperation::ExecuteUpsShutdown { command } => HelperResponse {
+                ok: true,
+                category: "ups".into(),
+                target: "shutdown".into(),
+                message: "mock UPS shutdown command executed".into(),
+                data: serde_json::json!({ "command": command }),
+            },
+            HelperOperation::ApplyDirectoryServiceSettings {
+                enabled,
+                provider,
+                domain,
+                uri,
+                base_dn,
+                bind_dn,
+                tls,
+            } => HelperResponse {
+                ok: true,
+                category: "directory_service".into(),
+                target: if domain.is_empty() { provider } else { domain },
+                message: "mock directory service settings applied".into(),
+                data: serde_json::json!({
+                    "enabled": enabled,
+                    "uri": uri,
+                    "base_dn": base_dn,
+                    "bind_dn": bind_dn,
+                    "tls": tls
                 }),
             },
             HelperOperation::ListSmartDisks => HelperResponse {
@@ -762,10 +854,59 @@ impl FreeBsdCommandBuilder {
                 "kern.osrelease".into(),
                 "kern.boottime".into(),
                 "hw.physmem".into(),
+                "hw.model".into(),
+                "hw.ncpu".into(),
+                "hw.pagesize".into(),
+                "vm.stats.vm.v_free_count".into(),
+                "vm.swap_total".into(),
                 "vm.loadavg".into(),
             ],
             HelperOperation::ListNetworkInterfaces => vec!["ifconfig".into(), "-a".into()],
+            HelperOperation::ApplyNetworkInterfaceConfig {
+                name,
+                mode,
+                ipv4_address,
+                netmask,
+                ..
+            } => build_network_sysrc_command(
+                name,
+                mode,
+                ipv4_address.as_deref(),
+                netmask.as_deref(),
+            )?,
+            HelperOperation::ApplyDnsResolverConfig {
+                nameservers,
+                search_domains,
+            } => {
+                validate_dns_resolver_config(nameservers, search_domains)?;
+                vec!["resolvconf".into(), "-u".into()]
+            }
+            HelperOperation::ApplyStaticRoutesConfig { routes } => {
+                validate_static_routes(routes)?;
+                vec!["service".into(), "routing".into(), "restart".into()]
+            }
             HelperOperation::ListUpsStatus => vec!["upsc".into(), "ups@localhost".into()],
+            HelperOperation::ExecuteUpsShutdown { command } => parse_ups_shutdown_command(command)?,
+            HelperOperation::ApplyDirectoryServiceSettings {
+                enabled,
+                provider,
+                domain,
+                uri,
+                base_dn,
+                bind_dn,
+                ..
+            } => {
+                safe_arg(provider)?;
+                if *enabled {
+                    for value in [domain, uri, base_dn] {
+                        safe_arg(value)?;
+                    }
+                    if let Some(bind_dn) = bind_dn {
+                        safe_arg(bind_dn)?;
+                    }
+                }
+                vec!["service".into(), "nslcd".into(), "restart".into()]
+            }
             HelperOperation::ListSmartDisks => vec!["smartctl".into(), "--scan".into()],
             HelperOperation::StartSmartTest {
                 device,
@@ -1277,6 +1418,232 @@ fn push_dataset_set_property(
     Ok(())
 }
 
+fn parse_ups_shutdown_command(command: &str) -> Result<Vec<String>, HelperError> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "shutdown" {
+        return Err(HelperError::Rejected(
+            "UPS shutdown command must be shutdown -p now, shutdown -h now, or use +minutes".into(),
+        ));
+    }
+    if !matches!(parts[1], "-p" | "-h") {
+        return Err(HelperError::Rejected(
+            "UPS shutdown command must use -p or -h".into(),
+        ));
+    }
+    let valid_time = parts[2] == "now"
+        || parts[2]
+            .strip_prefix('+')
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|minutes| minutes <= 1440);
+    if !valid_time {
+        return Err(HelperError::Rejected(
+            "UPS shutdown time must be now or +minutes up to 1440".into(),
+        ));
+    }
+    Ok(parts.into_iter().map(str::to_string).collect())
+}
+
+fn valid_network_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn valid_ipv4_address(value: &str) -> bool {
+    value.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+fn build_network_sysrc_command(
+    name: &str,
+    mode: &str,
+    ipv4_address: Option<&str>,
+    netmask: Option<&str>,
+) -> Result<Vec<String>, HelperError> {
+    if !valid_network_name(name) {
+        return Err(HelperError::Rejected(
+            "invalid network interface name".into(),
+        ));
+    }
+    let value = match mode {
+        "dhcp" => "DHCP".to_string(),
+        "static" => {
+            let address = ipv4_address
+                .filter(|value| valid_ipv4_address(value))
+                .ok_or_else(|| HelperError::Rejected("invalid IPv4 address".into()))?;
+            let netmask = netmask
+                .filter(|value| valid_ipv4_address(value))
+                .ok_or_else(|| HelperError::Rejected("invalid IPv4 netmask".into()))?;
+            format!("inet {address} netmask {netmask}")
+        }
+        _ => return Err(HelperError::Rejected("invalid network mode".into())),
+    };
+    Ok(vec!["sysrc".into(), format!("ifconfig_{name}={value}")])
+}
+
+fn valid_dns_domain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+}
+
+fn validate_dns_resolver_config(
+    nameservers: &[String],
+    search_domains: &[String],
+) -> Result<(), HelperError> {
+    if nameservers.is_empty() || nameservers.len() > 3 {
+        return Err(HelperError::Rejected(
+            "DNS resolver requires 1 to 3 nameservers".into(),
+        ));
+    }
+    for nameserver in nameservers {
+        if nameserver.parse::<std::net::IpAddr>().is_err() {
+            return Err(HelperError::Rejected("invalid DNS nameserver".into()));
+        }
+    }
+    if search_domains.len() > 6 {
+        return Err(HelperError::Rejected(
+            "DNS resolver supports up to 6 search domains".into(),
+        ));
+    }
+    for domain in search_domains {
+        if !valid_dns_domain(domain) {
+            return Err(HelperError::Rejected("invalid DNS search domain".into()));
+        }
+    }
+    Ok(())
+}
+
+fn render_resolv_conf(nameservers: &[String], search_domains: &[String]) -> String {
+    let mut lines = vec!["# Managed by bnasmgr".to_string()];
+    if !search_domains.is_empty() {
+        lines.push(format!("search {}", search_domains.join(" ")));
+    }
+    for nameserver in nameservers {
+        lines.push(format!("nameserver {nameserver}"));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn valid_route_destination(value: &str) -> bool {
+    if value == "default" {
+        return true;
+    }
+    let Some((addr, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    let Ok(ip) = addr.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(_) => prefix <= 32,
+        std::net::IpAddr::V6(_) => prefix <= 128,
+    }
+}
+
+fn valid_route_description(value: &str) -> bool {
+    value.len() <= 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '_' | '-' | '.'))
+}
+
+fn validate_static_routes(routes: &[StaticRouteConfig]) -> Result<(), HelperError> {
+    if routes.len() > 32 {
+        return Err(HelperError::Rejected(
+            "static route limit is 32 entries".into(),
+        ));
+    }
+    for route in routes {
+        if !valid_route_destination(&route.destination) {
+            return Err(HelperError::Rejected(
+                "invalid static route destination".into(),
+            ));
+        }
+        if route.gateway.parse::<std::net::IpAddr>().is_err() {
+            return Err(HelperError::Rejected("invalid static route gateway".into()));
+        }
+        if let Some(description) = route.description.as_deref() {
+            if !valid_route_description(description) {
+                return Err(HelperError::Rejected(
+                    "invalid static route description".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn static_route_name(index: usize) -> String {
+    format!("bnasmgr_route_{index}")
+}
+
+fn static_route_value(route: &StaticRouteConfig) -> String {
+    if route.destination == "default" {
+        format!("default {}", route.gateway)
+    } else {
+        format!("-net {} {}", route.destination, route.gateway)
+    }
+}
+
+fn render_nslcd_conf(
+    enabled: bool,
+    provider: &str,
+    domain: &str,
+    uri: &str,
+    base_dn: &str,
+    bind_dn: Option<&str>,
+    tls: bool,
+) -> String {
+    let mut lines = vec![
+        "# Managed by bnasmgr".to_string(),
+        format!("# provider {provider}"),
+    ];
+    if !enabled {
+        lines.push("# directory service disabled".into());
+        lines.push(String::new());
+        return lines.join("\n");
+    }
+    lines.extend([
+        format!("# domain {domain}"),
+        format!("uri {uri}"),
+        format!("base {base_dn}"),
+    ]);
+    if let Some(bind_dn) = bind_dn.filter(|value| !value.is_empty()) {
+        lines.push(format!("binddn {bind_dn}"));
+    }
+    if uri.starts_with("ldaps://") {
+        lines.push("ssl on".into());
+    } else {
+        lines.push("ssl off".into());
+        if tls {
+            lines.push("tls_start_tls yes".into());
+        }
+    }
+    lines.push(if tls {
+        "tls_reqcert demand".into()
+    } else {
+        "tls_reqcert allow".into()
+    });
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 #[derive(Debug, Default)]
 pub struct FreeBsdHelper;
 
@@ -1288,7 +1655,22 @@ impl HelperClient for FreeBsdHelper {
             HelperOperation::ListStorage => return freebsd_storage_overview().await,
             HelperOperation::SystemReport => return freebsd_system_report().await,
             HelperOperation::ListNetworkInterfaces => return freebsd_network_interfaces().await,
+            HelperOperation::ApplyNetworkInterfaceConfig { .. } => {
+                return freebsd_apply_network_interface_config(&operation).await
+            }
+            HelperOperation::ApplyDnsResolverConfig { .. } => {
+                return freebsd_apply_dns_resolver_config(&operation).await
+            }
+            HelperOperation::ApplyStaticRoutesConfig { .. } => {
+                return freebsd_apply_static_routes_config(&operation).await
+            }
             HelperOperation::ListUpsStatus => return freebsd_ups_status().await,
+            HelperOperation::ExecuteUpsShutdown { .. } => {
+                return freebsd_execute_ups_shutdown(&operation).await
+            }
+            HelperOperation::ApplyDirectoryServiceSettings { .. } => {
+                return freebsd_directory_service_settings(&operation).await
+            }
             HelperOperation::ListSmartDisks => return freebsd_smart_disks().await,
             HelperOperation::ListSmartSelfTests { .. } => {
                 return freebsd_smart_self_tests(&operation).await
@@ -1512,6 +1894,159 @@ async fn freebsd_network_interfaces() -> Result<HelperResponse, HelperError> {
     })
 }
 
+async fn freebsd_apply_network_interface_config(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::ApplyNetworkInterfaceConfig {
+        name,
+        mode,
+        ipv4_address,
+        netmask,
+        gateway,
+    } = operation
+    else {
+        return Err(HelperError::Rejected(
+            "expected network interface config operation".into(),
+        ));
+    };
+    let sysrc = run_command(FreeBsdCommandBuilder::build(operation)?).await?;
+    if !sysrc.ok {
+        return Ok(HelperResponse {
+            ok: false,
+            category: "network_config".into(),
+            target: name.clone(),
+            message: sysrc.stderr,
+            data: serde_json::json!({ "status": sysrc.status }),
+        });
+    }
+    if let Some(gateway) = gateway.as_deref().filter(|value| !value.is_empty()) {
+        if !valid_ipv4_address(gateway) {
+            return Err(HelperError::Rejected("invalid IPv4 gateway".into()));
+        }
+        let output = run_command(vec!["sysrc".into(), format!("defaultrouter={gateway}")]).await?;
+        if !output.ok {
+            return Ok(HelperResponse {
+                ok: false,
+                category: "network_config".into(),
+                target: name.clone(),
+                message: output.stderr,
+                data: serde_json::json!({ "status": output.status }),
+            });
+        }
+    }
+    let restart = run_command(vec![
+        "service".into(),
+        "netif".into(),
+        "restart".into(),
+        name.clone(),
+    ])
+    .await?;
+    if restart.ok && gateway.as_deref().is_some_and(|value| !value.is_empty()) {
+        let _ = run_command(vec!["service".into(), "routing".into(), "restart".into()]).await?;
+    }
+    Ok(HelperResponse {
+        ok: restart.ok,
+        category: "network_config".into(),
+        target: name.clone(),
+        message: if restart.ok {
+            format!("network interface set to {mode}")
+        } else {
+            restart.stderr
+        },
+        data: serde_json::json!({
+            "status": restart.status,
+            "ipv4_address": ipv4_address,
+            "netmask": netmask,
+            "gateway": gateway,
+        }),
+    })
+}
+
+async fn freebsd_apply_dns_resolver_config(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::ApplyDnsResolverConfig {
+        nameservers,
+        search_domains,
+    } = operation
+    else {
+        return Err(HelperError::Rejected(
+            "expected DNS resolver config operation".into(),
+        ));
+    };
+    validate_dns_resolver_config(nameservers, search_domains)?;
+    let path = std::env::var("BNASMGR_RESOLV_CONF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/etc/resolv.conf"));
+    atomic_write(&path, &render_resolv_conf(nameservers, search_domains)).await?;
+    Ok(HelperResponse {
+        ok: true,
+        category: "network_dns".into(),
+        target: "resolver".into(),
+        message: "DNS resolver settings applied".into(),
+        data: serde_json::json!({
+            "path": path,
+            "nameservers": nameservers,
+            "search_domains": search_domains,
+        }),
+    })
+}
+
+async fn freebsd_apply_static_routes_config(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::ApplyStaticRoutesConfig { routes } = operation else {
+        return Err(HelperError::Rejected(
+            "expected static routes config operation".into(),
+        ));
+    };
+    validate_static_routes(routes)?;
+    let names = (0..routes.len()).map(static_route_name).collect::<Vec<_>>();
+    let output = run_command(vec![
+        "sysrc".into(),
+        format!("static_routes={}", names.join(" ")),
+    ])
+    .await?;
+    if !output.ok {
+        return Ok(HelperResponse {
+            ok: false,
+            category: "network_routes".into(),
+            target: "static".into(),
+            message: output.stderr,
+            data: serde_json::json!({ "status": output.status }),
+        });
+    }
+    for (index, route) in routes.iter().enumerate() {
+        let route_name = static_route_name(index);
+        let output = run_command(vec![
+            "sysrc".into(),
+            format!("route_{route_name}={}", static_route_value(route)),
+        ])
+        .await?;
+        if !output.ok {
+            return Ok(HelperResponse {
+                ok: false,
+                category: "network_routes".into(),
+                target: "static".into(),
+                message: output.stderr,
+                data: serde_json::json!({ "status": output.status }),
+            });
+        }
+    }
+    let restart = run_command(vec!["service".into(), "routing".into(), "restart".into()]).await?;
+    Ok(HelperResponse {
+        ok: restart.ok,
+        category: "network_routes".into(),
+        target: "static".into(),
+        message: if restart.ok {
+            "static routes applied".into()
+        } else {
+            restart.stderr
+        },
+        data: serde_json::json!({ "routes": routes, "status": restart.status }),
+    })
+}
+
 async fn freebsd_ups_status() -> Result<HelperResponse, HelperError> {
     let output = run_command(FreeBsdCommandBuilder::build(
         &HelperOperation::ListUpsStatus,
@@ -1531,6 +2066,72 @@ async fn freebsd_ups_status() -> Result<HelperResponse, HelperError> {
         } else {
             serde_json::json!({})
         },
+    })
+}
+
+async fn freebsd_execute_ups_shutdown(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(operation)?).await?;
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "ups".into(),
+        target: "shutdown".into(),
+        message: if output.ok {
+            "UPS shutdown command executed".into()
+        } else {
+            output.stderr
+        },
+        data: serde_json::json!({ "status": output.status }),
+    })
+}
+
+async fn freebsd_directory_service_settings(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::ApplyDirectoryServiceSettings {
+        enabled,
+        provider,
+        domain,
+        uri,
+        base_dn,
+        bind_dn,
+        tls,
+    } = operation
+    else {
+        return Err(HelperError::Rejected(
+            "expected directory service settings operation".into(),
+        ));
+    };
+    FreeBsdCommandBuilder::build(operation)?;
+    let config_path = std::env::var("BNASMGR_NSLCD_CONF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/usr/local/etc/nslcd.conf"));
+    atomic_write(
+        &config_path,
+        &render_nslcd_conf(
+            *enabled,
+            provider,
+            domain,
+            uri,
+            base_dn,
+            bind_dn.as_deref(),
+            *tls,
+        ),
+    )
+    .await?;
+    let output = run_command(FreeBsdCommandBuilder::build(operation)?).await?;
+    let (category, target) = operation_category_target(operation);
+    Ok(HelperResponse {
+        ok: output.ok,
+        category,
+        target,
+        message: if output.ok {
+            "directory service settings applied".into()
+        } else {
+            output.stderr
+        },
+        data: serde_json::json!({ "status": output.status, "config_path": config_path }),
     })
 }
 
@@ -2410,6 +3011,31 @@ fn parse_system_report(stdout: &str) -> serde_json::Value {
         .trim()
         .parse::<u64>()
         .unwrap_or(0);
+    let cpu_model = lines.next().unwrap_or("unknown").trim();
+    let cpu_cores = lines
+        .next()
+        .unwrap_or("0")
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    let page_size = lines
+        .next()
+        .unwrap_or("0")
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let free_pages = lines
+        .next()
+        .unwrap_or("0")
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let swap_total = lines
+        .next()
+        .unwrap_or("0")
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
     let load = lines.next().unwrap_or("").trim();
     let boot_seconds = boottime
         .split("sec =")
@@ -2431,7 +3057,11 @@ fn parse_system_report(stdout: &str) -> serde_json::Value {
         "os": if os.is_empty() { "unknown" } else { os },
         "release": if release.is_empty() { "unknown" } else { release },
         "uptime_seconds": uptime_seconds,
+        "cpu_model": if cpu_model.is_empty() { "unknown" } else { cpu_model },
+        "cpu_cores": cpu_cores,
         "memory_bytes": memory,
+        "memory_free_bytes": page_size.saturating_mul(free_pages),
+        "swap_total_bytes": swap_total,
         "load_average": load_average,
     })
 }
@@ -3029,7 +3659,25 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
         HelperOperation::ListStorage => ("storage".into(), "overview".into()),
         HelperOperation::SystemReport => ("system_report".into(), "localhost".into()),
         HelperOperation::ListNetworkInterfaces => ("network".into(), "interfaces".into()),
+        HelperOperation::ApplyNetworkInterfaceConfig { name, .. } => {
+            ("network_config".into(), name.clone())
+        }
+        HelperOperation::ApplyDnsResolverConfig { .. } => ("network_dns".into(), "resolver".into()),
+        HelperOperation::ApplyStaticRoutesConfig { .. } => {
+            ("network_routes".into(), "static".into())
+        }
         HelperOperation::ListUpsStatus => ("ups".into(), "ups@localhost".into()),
+        HelperOperation::ExecuteUpsShutdown { .. } => ("ups".into(), "shutdown".into()),
+        HelperOperation::ApplyDirectoryServiceSettings {
+            provider, domain, ..
+        } => (
+            "directory_service".into(),
+            if domain.is_empty() {
+                provider.clone()
+            } else {
+                domain.clone()
+            },
+        ),
         HelperOperation::ListSmartDisks => ("disk_health".into(), "all".into()),
         HelperOperation::StartSmartTest { device, .. }
         | HelperOperation::ListSmartSelfTests { device, .. } => {
@@ -3235,17 +3883,26 @@ mod tests {
                 "kern.osrelease",
                 "kern.boottime",
                 "hw.physmem",
+                "hw.model",
+                "hw.ncpu",
+                "hw.pagesize",
+                "vm.stats.vm.v_free_count",
+                "vm.swap_total",
                 "vm.loadavg"
             ]
         );
 
         let report = parse_system_report(
-            "nasbox\nFreeBSD\n14.2-RELEASE\n{ sec = 1710000000, usec = 0 } Fri Mar  9 10:00:00 2024\n17179869184\n{ 0.12 0.18 0.21 }\n",
+            "nasbox\nFreeBSD\n14.2-RELEASE\n{ sec = 1710000000, usec = 0 } Fri Mar  9 10:00:00 2024\n17179869184\nAMD EPYC Mock\n8\n4096\n1048576\n4294967296\n{ 0.12 0.18 0.21 }\n",
         );
         assert_eq!(report["hostname"], "nasbox");
         assert_eq!(report["os"], "FreeBSD");
         assert_eq!(report["release"], "14.2-RELEASE");
         assert_eq!(report["memory_bytes"], 17179869184u64);
+        assert_eq!(report["cpu_model"], "AMD EPYC Mock");
+        assert_eq!(report["cpu_cores"], 8);
+        assert_eq!(report["memory_free_bytes"], 4294967296u64);
+        assert_eq!(report["swap_total_bytes"], 4294967296u64);
         assert_eq!(report["load_average"][0], 0.12);
     }
 
@@ -3267,6 +3924,99 @@ mod tests {
     }
 
     #[test]
+    fn network_interface_config_uses_sysrc_and_validates_ipv4() {
+        let dhcp = FreeBsdCommandBuilder::build(&HelperOperation::ApplyNetworkInterfaceConfig {
+            name: "em0".into(),
+            mode: "dhcp".into(),
+            ipv4_address: None,
+            netmask: None,
+            gateway: None,
+        })
+        .unwrap();
+        assert_eq!(dhcp, vec!["sysrc", "ifconfig_em0=DHCP"]);
+
+        let static_ip =
+            FreeBsdCommandBuilder::build(&HelperOperation::ApplyNetworkInterfaceConfig {
+                name: "em0".into(),
+                mode: "static".into(),
+                ipv4_address: Some("192.168.1.60".into()),
+                netmask: Some("255.255.255.0".into()),
+                gateway: Some("192.168.1.1".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            static_ip,
+            vec![
+                "sysrc",
+                "ifconfig_em0=inet 192.168.1.60 netmask 255.255.255.0"
+            ]
+        );
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::ApplyNetworkInterfaceConfig {
+            name: "bad;if".into(),
+            mode: "dhcp".into(),
+            ipv4_address: None,
+            netmask: None,
+            gateway: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid network interface"));
+    }
+
+    #[test]
+    fn dns_resolver_config_is_validated_and_rendered() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ApplyDnsResolverConfig {
+            nameservers: vec!["1.1.1.1".into(), "2001:4860:4860::8888".into()],
+            search_domains: vec!["lan".into(), "example.test".into()],
+        })
+        .unwrap();
+        assert_eq!(cmd, vec!["resolvconf", "-u"]);
+
+        let rendered = render_resolv_conf(
+            &["1.1.1.1".into(), "2001:4860:4860::8888".into()],
+            &["lan".into(), "example.test".into()],
+        );
+        assert!(rendered.contains("search lan example.test"));
+        assert!(rendered.contains("nameserver 1.1.1.1"));
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::ApplyDnsResolverConfig {
+            nameservers: vec!["not-an-ip".into()],
+            search_domains: vec![],
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid DNS nameserver"));
+    }
+
+    #[test]
+    fn static_routes_are_validated_and_restart_routing() {
+        let routes = vec![StaticRouteConfig {
+            destination: "10.10.0.0/16".into(),
+            gateway: "192.168.1.1".into(),
+            description: Some("lab route".into()),
+        }];
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ApplyStaticRoutesConfig {
+            routes: routes.clone(),
+        })
+        .unwrap();
+        assert_eq!(cmd, vec!["service", "routing", "restart"]);
+        assert_eq!(static_route_name(0), "bnasmgr_route_0");
+        assert_eq!(
+            static_route_value(&routes[0]),
+            "-net 10.10.0.0/16 192.168.1.1"
+        );
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::ApplyStaticRoutesConfig {
+            routes: vec![StaticRouteConfig {
+                destination: "not-cidr".into(),
+                gateway: "192.168.1.1".into(),
+                description: None,
+            }],
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid static route destination"));
+    }
+
+    #[test]
     fn ups_status_uses_nut_upsc_and_parses_state() {
         let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ListUpsStatus).unwrap();
         assert_eq!(cmd, vec!["upsc", "ups@localhost"]);
@@ -3280,6 +4030,71 @@ mod tests {
         assert_eq!(status["charge_percent"], 12);
         assert_eq!(status["runtime_seconds"], 140);
         assert_eq!(status["load_percent"], 37);
+    }
+
+    #[test]
+    fn ups_shutdown_command_is_narrowly_allowlisted() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ExecuteUpsShutdown {
+            command: "shutdown -p now".into(),
+        })
+        .unwrap();
+        assert_eq!(cmd, vec!["shutdown", "-p", "now"]);
+
+        let delayed = FreeBsdCommandBuilder::build(&HelperOperation::ExecuteUpsShutdown {
+            command: "shutdown -h +10".into(),
+        })
+        .unwrap();
+        assert_eq!(delayed, vec!["shutdown", "-h", "+10"]);
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::ExecuteUpsShutdown {
+            command: "reboot now".into(),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("UPS shutdown command"));
+    }
+
+    #[test]
+    fn directory_service_settings_restart_nslcd_with_safe_args() {
+        let cmd = FreeBsdCommandBuilder::build(&HelperOperation::ApplyDirectoryServiceSettings {
+            enabled: true,
+            provider: "ldap".into(),
+            domain: "example.test".into(),
+            uri: "ldaps://directory.example.test".into(),
+            base_dn: "dc=example,dc=test".into(),
+            bind_dn: Some("cn=readonly,dc=example,dc=test".into()),
+            tls: true,
+        })
+        .unwrap();
+        assert_eq!(cmd, vec!["service", "nslcd", "restart"]);
+        let rendered = render_nslcd_conf(
+            true,
+            "ldap",
+            "example.test",
+            "ldaps://directory.example.test",
+            "dc=example,dc=test",
+            Some("cn=readonly,dc=example,dc=test"),
+            true,
+        );
+        assert!(rendered.contains("uri ldaps://directory.example.test"));
+        assert!(rendered.contains("base dc=example,dc=test"));
+        assert!(rendered.contains("binddn cn=readonly,dc=example,dc=test"));
+        assert!(rendered.contains("ssl on"));
+        assert!(rendered.contains("tls_reqcert demand"));
+
+        let disabled = render_nslcd_conf(false, "ldap", "", "", "", None, false);
+        assert!(disabled.contains("directory service disabled"));
+
+        let err = FreeBsdCommandBuilder::build(&HelperOperation::ApplyDirectoryServiceSettings {
+            enabled: true,
+            provider: "ldap".into(),
+            domain: "bad;domain".into(),
+            uri: "ldaps://directory.example.test".into(),
+            base_dn: "dc=example,dc=test".into(),
+            bind_dn: None,
+            tls: true,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("unsafe command argument"));
     }
 
     #[test]

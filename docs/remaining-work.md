@@ -15,11 +15,16 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - Typed helper protocol over a Unix socket, with mock and FreeBSD backends.
 - FreeBSD command construction/parsing for ZFS storage, snapshots, quotas, services, logs, Samba users, and Samba/NFS/iSCSI fragment application.
 - Dataset create, property update, and delete workflows for compression, atime, quota, reservation, and mountpoint controls.
-- Read-only system reporting for host, OS, uptime, memory, and load averages.
+- Read-only system reporting for host, OS, uptime, CPU model/core count, memory, free memory, swap total, and load averages.
 - Read-only network interface inventory for status, addresses, MAC, and MTU.
+- Network interface DHCP/static IPv4 configuration persistence and helper-applied FreeBSD `sysrc`/`netif` workflow.
+- DNS resolver nameserver/search-domain persistence and helper-rendered `resolv.conf` workflow.
+- Static route persistence and helper-applied FreeBSD `static_routes`/`route_*` workflow.
 - Service monitoring/control for `zfs`, `samba_server`, `nfsd`, `mountd`, `rpcbind`, `ctld`, and `syslogd`.
 - UPS status monitoring through NUT `upsc ups@localhost`.
 - UPS policy settings for low charge/runtime thresholds and intended shutdown command.
+- Confirmed UPS shutdown execution through a typed helper operation limited to `shutdown -p|-h now|+minutes`.
+- Directory service settings for LDAP/Active Directory connection metadata, validation, audit, config backup/restore, helper-rendered `nslcd.conf`, and helper-owned `nslcd` restart application.
 - Pool scrub status plus start/stop controls.
 - SMART disk health inventory with self-test launch and history.
 - Computed alerts for degraded pools, unhealthy disks, stopped services, and failed helper operations.
@@ -38,8 +43,7 @@ The recovered MVP implementation plan is functionally complete in this repo:
 The next implementation track is modeled after common TrueNAS-style NAS administration:
 
 - Scheduled snapshot tasks with cadence and retention metadata.
-- Directory service integration.
-- UPS shutdown execution integration, network configuration writes, directory service integration, and deeper system reporting.
+- Directory service NSS/PAM wiring and Active Directory join validation on target FreeBSD hosts.
 
 ## Verification Commands
 

@@ -347,12 +347,29 @@ pub fn app_with_static_dir(state: AppState, static_dir: Option<PathBuf>) -> Rout
         )
         .route("/api/system/groups/:name", delete(delete_local_group))
         .route("/api/system/ups", get(ups_status))
+        .route("/api/system/ups/shutdown", post(execute_ups_shutdown))
         .route(
             "/api/system/ups/policy",
             get(get_ups_policy).post(save_ups_policy),
         )
+        .route(
+            "/api/system/directory-service",
+            get(get_directory_service_settings).post(save_directory_service_settings),
+        )
         .route("/api/system/report", get(system_report))
         .route("/api/system/network", get(network_interfaces))
+        .route(
+            "/api/system/network/config",
+            get(get_network_config).post(save_network_config),
+        )
+        .route(
+            "/api/system/network/dns",
+            get(get_dns_config).post(save_dns_config),
+        )
+        .route(
+            "/api/system/network/routes",
+            get(get_static_routes).post(save_static_route),
+        )
         .route("/api/storage/overview", get(storage_overview))
         .route("/api/storage/datasets", post(create_dataset))
         .route("/api/storage/datasets/properties", post(update_dataset))
@@ -1108,6 +1125,51 @@ struct UpsPolicySettings {
     shutdown_command: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DirectoryServiceSettings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_directory_provider")]
+    provider: String,
+    #[serde(default)]
+    domain: String,
+    #[serde(default)]
+    uri: String,
+    #[serde(default)]
+    base_dn: String,
+    #[serde(default)]
+    bind_dn: String,
+    #[serde(default)]
+    tls: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct NetworkInterfaceConfig {
+    name: String,
+    mode: String,
+    #[serde(default)]
+    ipv4_address: Option<String>,
+    #[serde(default)]
+    netmask: Option<String>,
+    #[serde(default)]
+    gateway: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DnsResolverConfig {
+    nameservers: Vec<String>,
+    #[serde(default)]
+    search_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct StaticRouteRequest {
+    destination: String,
+    gateway: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
 #[derive(Serialize)]
 struct AlertNotificationHistoryItem {
     channel: String,
@@ -1127,6 +1189,24 @@ impl Default for UpsPolicySettings {
             shutdown_command: default_ups_shutdown_command(),
         }
     }
+}
+
+impl Default for DirectoryServiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_directory_provider(),
+            domain: String::new(),
+            uri: String::new(),
+            base_dn: String::new(),
+            bind_dn: String::new(),
+            tls: true,
+        }
+    }
+}
+
+fn default_directory_provider() -> String {
+    "ldap".into()
 }
 
 fn default_ups_low_charge_percent() -> u8 {
@@ -1708,6 +1788,347 @@ async fn network_interfaces(
     ))
 }
 
+fn validate_network_interface_name(name: &str) -> Result<(), ApiError> {
+    reject_shell_chars(name, "network interface")?;
+    if name.len() > 32
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(ApiError::bad_request("network interface name is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_optional_ipv4(value: Option<&String>, field: &str) -> Result<(), ApiError> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        reject_shell_chars(value, field)?;
+        if value.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(ApiError::bad_request(format!(
+                "{field} must be an IPv4 address"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_network_config(config: &NetworkInterfaceConfig) -> Result<(), ApiError> {
+    validate_network_interface_name(&config.name)?;
+    if !matches!(config.mode.as_str(), "dhcp" | "static") {
+        return Err(ApiError::bad_request("network mode must be dhcp or static"));
+    }
+    validate_optional_ipv4(config.ipv4_address.as_ref(), "IPv4 address")?;
+    validate_optional_ipv4(config.netmask.as_ref(), "IPv4 netmask")?;
+    validate_optional_ipv4(config.gateway.as_ref(), "IPv4 gateway")?;
+    if config.mode == "static"
+        && (config
+            .ipv4_address
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+            || config
+                .netmask
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "static network mode requires IPv4 address and netmask",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_network_config(state: &AppState) -> Result<Vec<NetworkInterfaceConfig>, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("select value from app_settings where key = 'network_config'")
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+async fn get_network_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<NetworkInterfaceConfig>>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(load_network_config(&state).await?))
+}
+
+async fn save_network_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(config): Json<NetworkInterfaceConfig>,
+) -> Result<Json<Vec<NetworkInterfaceConfig>>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_network_config(&config)?;
+    state
+        .helper(
+            &user.username,
+            HelperOperation::ApplyNetworkInterfaceConfig {
+                name: config.name.clone(),
+                mode: config.mode.clone(),
+                ipv4_address: config
+                    .ipv4_address
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                netmask: config
+                    .netmask
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                gateway: config
+                    .gateway
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+            },
+        )
+        .await?;
+    let mut configs = load_network_config(&state).await?;
+    configs.retain(|item| item.name != config.name);
+    configs.push(config.clone());
+    configs.sort_by(|left, right| left.name.cmp(&right.name));
+    sqlx::query(
+        "insert into app_settings (key, value) values ('network_config', ?)
+         on conflict(key) do update set value = excluded.value",
+    )
+    .bind(serde_json::to_string(&configs).map_err(|err| ApiError::internal(err.to_string()))?)
+    .execute(&state.db)
+    .await?;
+    state
+        .audit(
+            &user.username,
+            "network_config",
+            &config.name,
+            "ok",
+            "network interface configuration saved",
+        )
+        .await?;
+    Ok(Json(configs))
+}
+
+fn valid_dns_domain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+}
+
+fn validate_dns_config(config: &DnsResolverConfig) -> Result<(), ApiError> {
+    if config.nameservers.is_empty() || config.nameservers.len() > 3 {
+        return Err(ApiError::bad_request(
+            "DNS resolver requires 1 to 3 nameservers",
+        ));
+    }
+    for nameserver in &config.nameservers {
+        reject_shell_chars(nameserver, "DNS nameserver")?;
+        if nameserver.parse::<std::net::IpAddr>().is_err() {
+            return Err(ApiError::bad_request(
+                "DNS nameserver must be an IPv4 or IPv6 address",
+            ));
+        }
+    }
+    if config.search_domains.len() > 6 {
+        return Err(ApiError::bad_request(
+            "DNS resolver supports up to 6 search domains",
+        ));
+    }
+    for domain in &config.search_domains {
+        reject_shell_chars(domain, "DNS search domain")?;
+        if !valid_dns_domain(domain) {
+            return Err(ApiError::bad_request("DNS search domain is invalid"));
+        }
+    }
+    Ok(())
+}
+
+async fn load_dns_config(state: &AppState) -> Result<DnsResolverConfig, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("select value from app_settings where key = 'network_dns'")
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or(DnsResolverConfig {
+            nameservers: vec![],
+            search_domains: vec![],
+        }))
+}
+
+async fn get_dns_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DnsResolverConfig>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(load_dns_config(&state).await?))
+}
+
+async fn save_dns_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(config): Json<DnsResolverConfig>,
+) -> Result<Json<DnsResolverConfig>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_dns_config(&config)?;
+    state
+        .helper(
+            &user.username,
+            HelperOperation::ApplyDnsResolverConfig {
+                nameservers: config.nameservers.clone(),
+                search_domains: config.search_domains.clone(),
+            },
+        )
+        .await?;
+    sqlx::query(
+        "insert into app_settings (key, value) values ('network_dns', ?)
+         on conflict(key) do update set value = excluded.value",
+    )
+    .bind(serde_json::to_string(&config).map_err(|err| ApiError::internal(err.to_string()))?)
+    .execute(&state.db)
+    .await?;
+    state
+        .audit(
+            &user.username,
+            "network_dns",
+            "resolver",
+            "ok",
+            "DNS resolver configuration saved",
+        )
+        .await?;
+    Ok(Json(config))
+}
+
+fn valid_route_destination(value: &str) -> bool {
+    if value == "default" {
+        return true;
+    }
+    let Some((addr, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    let Ok(ip) = addr.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(_) => prefix <= 32,
+        std::net::IpAddr::V6(_) => prefix <= 128,
+    }
+}
+
+fn validate_static_route(route: &StaticRouteRequest) -> Result<(), ApiError> {
+    reject_shell_chars(&route.destination, "static route destination")?;
+    if !valid_route_destination(&route.destination) {
+        return Err(ApiError::bad_request(
+            "static route destination must be default or CIDR",
+        ));
+    }
+    reject_shell_chars(&route.gateway, "static route gateway")?;
+    if route.gateway.parse::<std::net::IpAddr>().is_err() {
+        return Err(ApiError::bad_request(
+            "static route gateway must be an IPv4 or IPv6 address",
+        ));
+    }
+    if let Some(description) = route.description.as_deref() {
+        if !description.trim().is_empty() {
+            reject_shell_chars(description, "static route description")?;
+            if description.len() > 64
+                || !description
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '_' | '-' | '.'))
+            {
+                return Err(ApiError::bad_request("static route description is invalid"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn load_static_routes(state: &AppState) -> Result<Vec<StaticRouteRequest>, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("select value from app_settings where key = 'network_routes'")
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+async fn get_static_routes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<StaticRouteRequest>>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(load_static_routes(&state).await?))
+}
+
+async fn save_static_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(route): Json<StaticRouteRequest>,
+) -> Result<Json<Vec<StaticRouteRequest>>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_static_route(&route)?;
+    let mut routes = load_static_routes(&state).await?;
+    routes.retain(|item| item.destination != route.destination);
+    routes.push(route.clone());
+    routes.sort_by(|left, right| left.destination.cmp(&right.destination));
+    state
+        .helper(
+            &user.username,
+            HelperOperation::ApplyStaticRoutesConfig {
+                routes: routes
+                    .iter()
+                    .map(|route| bnasmgr_helper::StaticRouteConfig {
+                        destination: route.destination.clone(),
+                        gateway: route.gateway.clone(),
+                        description: route
+                            .description
+                            .clone()
+                            .filter(|value| !value.trim().is_empty()),
+                    })
+                    .collect(),
+            },
+        )
+        .await?;
+    sqlx::query(
+        "insert into app_settings (key, value) values ('network_routes', ?)
+         on conflict(key) do update set value = excluded.value",
+    )
+    .bind(serde_json::to_string(&routes).map_err(|err| ApiError::internal(err.to_string()))?)
+    .execute(&state.db)
+    .await?;
+    state
+        .audit(
+            &user.username,
+            "network_routes",
+            &route.destination,
+            "ok",
+            "static route configuration saved",
+        )
+        .await?;
+    Ok(Json(routes))
+}
+
 fn validate_ups_policy(settings: &UpsPolicySettings) -> Result<(), ApiError> {
     if settings.low_charge_percent > 100 {
         return Err(ApiError::bad_request(
@@ -1724,6 +2145,32 @@ fn validate_ups_policy(settings: &UpsPolicySettings) -> Result<(), ApiError> {
     }
     if settings.enabled || !settings.shutdown_command.trim().is_empty() {
         reject_shell_chars(&settings.shutdown_command, "UPS shutdown command")?;
+        validate_ups_shutdown_command(&settings.shutdown_command)?;
+    }
+    Ok(())
+}
+
+fn validate_ups_shutdown_command(command: &str) -> Result<(), ApiError> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "shutdown" {
+        return Err(ApiError::bad_request(
+            "UPS shutdown command must be shutdown -p now, shutdown -h now, or use +minutes",
+        ));
+    }
+    if !matches!(parts[1], "-p" | "-h") {
+        return Err(ApiError::bad_request(
+            "UPS shutdown command must use -p or -h",
+        ));
+    }
+    let valid_time = parts[2] == "now"
+        || parts[2]
+            .strip_prefix('+')
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|minutes| minutes <= 1440);
+    if !valid_time {
+        return Err(ApiError::bad_request(
+            "UPS shutdown time must be now or +minutes up to 1440",
+        ));
     }
     Ok(())
 }
@@ -1764,6 +2211,153 @@ async fn save_ups_policy(
     .await?;
     state
         .audit(&user.username, "ups", "policy", "ok", "UPS policy saved")
+        .await?;
+    Ok(Json(settings))
+}
+
+fn require_ups_shutdown_confirmation(headers: &HeaderMap) -> Result<(), ApiError> {
+    let confirmed = headers
+        .get("x-bnasmgr-confirm")
+        .and_then(|value| value.to_str().ok());
+    if confirmed != Some("EXECUTE UPS SHUTDOWN") {
+        return Err(ApiError::bad_request(
+            "UPS shutdown requires x-bnasmgr-confirm header set to EXECUTE UPS SHUTDOWN",
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_ups_shutdown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    require_ups_shutdown_confirmation(&headers)?;
+    let policy = load_ups_policy(&state).await?;
+    validate_ups_policy(&policy)?;
+    if !policy.enabled {
+        return Err(ApiError::bad_request(
+            "UPS policy must be enabled before executing shutdown",
+        ));
+    }
+    let data = state
+        .helper(
+            &user.username,
+            HelperOperation::ExecuteUpsShutdown {
+                command: policy.shutdown_command.clone(),
+            },
+        )
+        .await?;
+    state
+        .audit(
+            &user.username,
+            "ups",
+            "shutdown",
+            "ok",
+            "UPS shutdown command executed",
+        )
+        .await?;
+    Ok(Json(data))
+}
+
+fn validate_directory_service_settings(
+    settings: &DirectoryServiceSettings,
+) -> Result<(), ApiError> {
+    if !matches!(settings.provider.as_str(), "ldap" | "active_directory") {
+        return Err(ApiError::bad_request(
+            "directory provider must be ldap or active_directory",
+        ));
+    }
+    for (label, value, max) in [
+        ("directory domain", settings.domain.as_str(), 253),
+        ("directory URI", settings.uri.as_str(), 300),
+        ("directory base DN", settings.base_dn.as_str(), 300),
+        ("directory bind DN", settings.bind_dn.as_str(), 300),
+    ] {
+        if value.len() > max {
+            return Err(ApiError::bad_request(format!("{label} is too long")));
+        }
+        if !value.trim().is_empty() {
+            reject_shell_chars(value, label)?;
+        }
+    }
+    if settings.enabled {
+        if settings.domain.trim().is_empty()
+            || settings.uri.trim().is_empty()
+            || settings.base_dn.trim().is_empty()
+        {
+            return Err(ApiError::bad_request(
+                "enabled directory service settings require domain, URI, and base DN",
+            ));
+        }
+        if !(settings.uri.starts_with("ldap://") || settings.uri.starts_with("ldaps://")) {
+            return Err(ApiError::bad_request(
+                "directory URI must start with ldap:// or ldaps://",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn load_directory_service_settings(
+    state: &AppState,
+) -> Result<DirectoryServiceSettings, ApiError> {
+    let value: Option<String> =
+        sqlx::query_scalar("select value from app_settings where key = 'directory_service'")
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+async fn get_directory_service_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DirectoryServiceSettings>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_admin(&user)?;
+    Ok(Json(load_directory_service_settings(&state).await?))
+}
+
+async fn save_directory_service_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<DirectoryServiceSettings>,
+) -> Result<Json<DirectoryServiceSettings>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    validate_directory_service_settings(&settings)?;
+    state
+        .helper(
+            &user.username,
+            HelperOperation::ApplyDirectoryServiceSettings {
+                enabled: settings.enabled,
+                provider: settings.provider.clone(),
+                domain: settings.domain.clone(),
+                uri: settings.uri.clone(),
+                base_dn: settings.base_dn.clone(),
+                bind_dn: (!settings.bind_dn.trim().is_empty()).then(|| settings.bind_dn.clone()),
+                tls: settings.tls,
+            },
+        )
+        .await?;
+    sqlx::query(
+        "insert into app_settings (key, value) values ('directory_service', ?)
+         on conflict(key) do update set value = excluded.value",
+    )
+    .bind(serde_json::to_string(&settings).map_err(|err| ApiError::internal(err.to_string()))?)
+    .execute(&state.db)
+    .await?;
+    state
+        .audit(
+            &user.username,
+            "directory_service",
+            &settings.domain,
+            "ok",
+            "directory service settings saved",
+        )
         .await?;
     Ok(Json(settings))
 }
@@ -5254,6 +5848,10 @@ mod tests {
         let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(report["hostname"], "bnasmgr-mock");
         assert_eq!(report["os"], "FreeBSD");
+        assert_eq!(report["cpu_model"], "Mock CPU");
+        assert_eq!(report["cpu_cores"], 8);
+        assert_eq!(report["memory_free_bytes"], 8589934592u64);
+        assert_eq!(report["swap_total_bytes"], 4294967296u64);
         assert_eq!(report["load_average"][0], 0.12);
     }
 
@@ -5275,6 +5873,129 @@ mod tests {
         let interfaces: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(interfaces[0]["name"], "em0");
         assert_eq!(interfaces[0]["ipv4"][0], "192.168.1.50");
+    }
+
+    #[tokio::test]
+    async fn network_config_is_admin_managed() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/network/config")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"em0","mode":"static","ipv4_address":"192.168.1.60","netmask":"255.255.255.0","gateway":"192.168.1.1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let configs: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(configs[0]["name"], "em0");
+        assert_eq!(configs[0]["mode"], "static");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/network/config")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"bad;if","mode":"dhcp","ipv4_address":"","netmask":"","gateway":""}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dns_config_is_admin_managed() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/network/dns")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"nameservers":["1.1.1.1","2001:4860:4860::8888"],"search_domains":["lan","example.test"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["nameservers"][0], "1.1.1.1");
+        assert_eq!(config["search_domains"][1], "example.test");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/network/dns")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"nameservers":["not-an-ip"],"search_domains":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn static_routes_are_admin_managed() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/network/routes")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"destination":"10.10.0.0/16","gateway":"192.168.1.1","description":"lab route"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let routes: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(routes[0]["destination"], "10.10.0.0/16");
+        assert_eq!(routes[0]["gateway"], "192.168.1.1");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/network/routes")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"destination":"not-cidr","gateway":"192.168.1.1","description":""}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -5335,6 +6056,35 @@ mod tests {
             .any(|item| { item["category"] == "ups" && item["target"] == "charge" }));
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/ups/shutdown")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/ups/shutdown")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-bnasmgr-confirm", "EXECUTE UPS SHUTDOWN")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -5343,6 +6093,60 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"enabled":true,"low_charge_percent":101,"min_runtime_seconds":300,"shutdown_command":"shutdown -p now"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn directory_service_settings_are_admin_managed() {
+        let (app, token) = login_admin(test_app().await).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/directory-service")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settings["enabled"], false);
+        assert_eq!(settings["provider"], "ldap");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/directory-service")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"enabled":true,"provider":"ldap","domain":"example.test","uri":"ldaps://directory.example.test","base_dn":"dc=example,dc=test","bind_dn":"cn=readonly,dc=example,dc=test","tls":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/directory-service")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"enabled":true,"provider":"ldap","domain":"bad;domain","uri":"ldaps://directory.example.test","base_dn":"dc=example,dc=test","bind_dn":"","tls":true}"#,
                     ))
                     .unwrap(),
             )
