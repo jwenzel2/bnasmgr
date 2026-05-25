@@ -356,6 +356,18 @@ pub fn app_with_static_dir(state: AppState, static_dir: Option<PathBuf>) -> Rout
             "/api/system/directory-service",
             get(get_directory_service_settings).post(save_directory_service_settings),
         )
+        .route(
+            "/api/system/directory-service/validate",
+            post(validate_directory_service),
+        )
+        .route(
+            "/api/system/directory-service/join",
+            post(join_active_directory),
+        )
+        .route(
+            "/api/system/directory-service/leave",
+            post(leave_active_directory),
+        )
         .route("/api/system/report", get(system_report))
         .route("/api/system/network", get(network_interfaces))
         .route(
@@ -951,6 +963,26 @@ fn redacted_operation_json(operation: &HelperOperation) -> String {
                 "create_home": create_home,
             }
         }),
+        HelperOperation::JoinActiveDirectory {
+            domain, username, ..
+        } => serde_json::json!({
+            "join_active_directory": {
+                "domain": domain,
+                "username": username,
+                "password": "<redacted>",
+            }
+        }),
+        HelperOperation::LeaveActiveDirectory {
+            domain,
+            username,
+            password,
+        } => serde_json::json!({
+            "leave_active_directory": {
+                "domain": domain,
+                "username": username,
+                "password": password.as_ref().map(|_| "<redacted>"),
+            }
+        }),
         _ => serde_json::to_value(operation).unwrap_or_else(|_| serde_json::json!({})),
     };
     value.to_string()
@@ -1141,6 +1173,26 @@ struct DirectoryServiceSettings {
     bind_dn: String,
     #[serde(default)]
     tls: bool,
+    #[serde(default)]
+    ca_cert_path: String,
+    #[serde(default)]
+    nss_enabled: bool,
+    #[serde(default)]
+    pam_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ActiveDirectoryJoinRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ActiveDirectoryLeaveRequest {
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1201,6 +1253,9 @@ impl Default for DirectoryServiceSettings {
             base_dn: String::new(),
             bind_dn: String::new(),
             tls: true,
+            ca_cert_path: String::new(),
+            nss_enabled: false,
+            pam_enabled: false,
         }
     }
 }
@@ -2274,6 +2329,11 @@ fn validate_directory_service_settings(
         ("directory URI", settings.uri.as_str(), 300),
         ("directory base DN", settings.base_dn.as_str(), 300),
         ("directory bind DN", settings.bind_dn.as_str(), 300),
+        (
+            "directory CA certificate path",
+            settings.ca_cert_path.as_str(),
+            512,
+        ),
     ] {
         if value.len() > max {
             return Err(ApiError::bad_request(format!("{label} is too long")));
@@ -2296,6 +2356,63 @@ fn validate_directory_service_settings(
                 "directory URI must start with ldap:// or ldaps://",
             ));
         }
+    }
+    if !settings.ca_cert_path.trim().is_empty() {
+        validate_absolute_path(&settings.ca_cert_path)?;
+    }
+    Ok(())
+}
+
+fn validate_active_directory_join_request(
+    body: &ActiveDirectoryJoinRequest,
+) -> Result<(), ApiError> {
+    validate_active_directory_credentials(&body.username, &body.password, true, "join")
+}
+
+fn validate_active_directory_leave_request(
+    body: &ActiveDirectoryLeaveRequest,
+) -> Result<(), ApiError> {
+    validate_active_directory_credentials(&body.username, &body.password, false, "leave")
+}
+
+fn validate_active_directory_credentials(
+    username: &str,
+    password: &str,
+    required: bool,
+    action: &str,
+) -> Result<(), ApiError> {
+    if username.len() > 253 {
+        return Err(ApiError::bad_request(format!(
+            "Active Directory {action} username is too long"
+        )));
+    }
+    if !username.trim().is_empty() {
+        reject_shell_chars(username, &format!("Active Directory {action} username"))?;
+    }
+    if required && username.trim().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Active Directory {action} username is required"
+        )));
+    }
+    if password.len() > 512 {
+        return Err(ApiError::bad_request(format!(
+            "Active Directory {action} password must be 512 characters or fewer"
+        )));
+    }
+    if required && password.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Active Directory {action} password is required"
+        )));
+    }
+    if !password.is_empty() && username.trim().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Active Directory {action} username is required when a password is provided"
+        )));
+    }
+    if password.contains('\0') || password.contains('\n') {
+        return Err(ApiError::bad_request(format!(
+            "Active Directory {action} password contains unsafe characters"
+        )));
     }
     Ok(())
 }
@@ -2340,6 +2457,10 @@ async fn save_directory_service_settings(
                 base_dn: settings.base_dn.clone(),
                 bind_dn: (!settings.bind_dn.trim().is_empty()).then(|| settings.bind_dn.clone()),
                 tls: settings.tls,
+                ca_cert_path: (!settings.ca_cert_path.trim().is_empty())
+                    .then(|| settings.ca_cert_path.clone()),
+                nss_enabled: settings.nss_enabled,
+                pam_enabled: settings.pam_enabled,
             },
         )
         .await?;
@@ -2360,6 +2481,118 @@ async fn save_directory_service_settings(
         )
         .await?;
     Ok(Json(settings))
+}
+
+async fn validate_directory_service(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    let settings = load_directory_service_settings(&state).await?;
+    validate_directory_service_settings(&settings)?;
+    if !settings.enabled {
+        return Err(ApiError::bad_request(
+            "directory service must be enabled before validation",
+        ));
+    }
+    let data = state
+        .helper(
+            &user.username,
+            HelperOperation::ValidateDirectoryService {
+                provider: settings.provider.clone(),
+                domain: settings.domain.clone(),
+                uri: settings.uri.clone(),
+                tls: settings.tls,
+                ca_cert_path: (!settings.ca_cert_path.trim().is_empty())
+                    .then(|| settings.ca_cert_path.clone()),
+            },
+        )
+        .await?;
+    state
+        .audit(
+            &user.username,
+            "directory_service",
+            &settings.domain,
+            "ok",
+            "directory service validation completed",
+        )
+        .await?;
+    Ok(Json(data))
+}
+
+async fn join_active_directory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ActiveDirectoryJoinRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    let settings = load_directory_service_settings(&state).await?;
+    validate_directory_service_settings(&settings)?;
+    validate_active_directory_join_request(&body)?;
+    if !settings.enabled || settings.provider != "active_directory" {
+        return Err(ApiError::bad_request(
+            "Active Directory settings must be enabled before joining",
+        ));
+    }
+    let data = state
+        .helper(
+            &user.username,
+            HelperOperation::JoinActiveDirectory {
+                domain: settings.domain.clone(),
+                username: body.username.clone(),
+                password: body.password,
+            },
+        )
+        .await?;
+    state
+        .audit(
+            &user.username,
+            "directory_service",
+            &settings.domain,
+            "ok",
+            "Active Directory join requested",
+        )
+        .await?;
+    Ok(Json(data))
+}
+
+async fn leave_active_directory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ActiveDirectoryLeaveRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = auth(&headers, &state).await?;
+    require_privileged(&user)?;
+    let settings = load_directory_service_settings(&state).await?;
+    validate_directory_service_settings(&settings)?;
+    validate_active_directory_leave_request(&body)?;
+    if !settings.enabled || settings.provider != "active_directory" {
+        return Err(ApiError::bad_request(
+            "Active Directory settings must be enabled before leaving",
+        ));
+    }
+    let data = state
+        .helper(
+            &user.username,
+            HelperOperation::LeaveActiveDirectory {
+                domain: settings.domain.clone(),
+                username: (!body.username.trim().is_empty()).then(|| body.username.clone()),
+                password: (!body.password.is_empty()).then(|| body.password),
+            },
+        )
+        .await?;
+    state
+        .audit(
+            &user.username,
+            "directory_service",
+            &settings.domain,
+            "ok",
+            "Active Directory leave requested",
+        )
+        .await?;
+    Ok(Json(data))
 }
 
 async fn upsert_local_user(
@@ -5349,6 +5582,79 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/directory-service")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"enabled":true,"provider":"active_directory","domain":"example.test","uri":"ldaps://directory.example.test","base_dn":"dc=example,dc=test","bind_dn":"cn=readonly,dc=example,dc=test","tls":true,"ca_cert_path":"/usr/local/etc/ssl/certs/directory-ca.pem","nss_enabled":true,"pam_enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/directory-service/join")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"join-admin","password":"supersecret"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/directory-service/leave")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"join-admin","password":"leavesecret"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/audit/helper-history")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let serialized = history.to_string();
+        assert!(serialized.contains("join_active_directory"));
+        assert!(serialized.contains("leave_active_directory"));
+        assert!(serialized.contains("<redacted>"));
+        assert!(!serialized.contains("supersecret"));
+        assert!(!serialized.contains("leavesecret"));
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -6120,6 +6426,9 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(settings["enabled"], false);
         assert_eq!(settings["provider"], "ldap");
+        assert_eq!(settings["ca_cert_path"], "");
+        assert_eq!(settings["nss_enabled"], false);
+        assert_eq!(settings["pam_enabled"], false);
 
         let response = app
             .clone()
@@ -6130,8 +6439,22 @@ mod tests {
                     .header("authorization", format!("Bearer {token}"))
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"enabled":true,"provider":"ldap","domain":"example.test","uri":"ldaps://directory.example.test","base_dn":"dc=example,dc=test","bind_dn":"cn=readonly,dc=example,dc=test","tls":true}"#,
+                        r#"{"enabled":true,"provider":"ldap","domain":"example.test","uri":"ldaps://directory.example.test","base_dn":"dc=example,dc=test","bind_dn":"cn=readonly,dc=example,dc=test","tls":true,"ca_cert_path":"/usr/local/etc/ssl/certs/directory-ca.pem","nss_enabled":true,"pam_enabled":true}"#,
                     ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/system/directory-service/validate")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await

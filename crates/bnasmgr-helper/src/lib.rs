@@ -50,6 +50,26 @@ pub enum HelperOperation {
         base_dn: String,
         bind_dn: Option<String>,
         tls: bool,
+        ca_cert_path: Option<String>,
+        nss_enabled: bool,
+        pam_enabled: bool,
+    },
+    ValidateDirectoryService {
+        provider: String,
+        domain: String,
+        uri: String,
+        tls: bool,
+        ca_cert_path: Option<String>,
+    },
+    JoinActiveDirectory {
+        domain: String,
+        username: String,
+        password: String,
+    },
+    LeaveActiveDirectory {
+        domain: String,
+        username: Option<String>,
+        password: Option<String>,
     },
     ListSmartDisks,
     StartSmartTest {
@@ -397,6 +417,9 @@ impl HelperClient for MockHelper {
                 base_dn,
                 bind_dn,
                 tls,
+                ca_cert_path,
+                nss_enabled,
+                pam_enabled,
             } => HelperResponse {
                 ok: true,
                 category: "directory_service".into(),
@@ -407,8 +430,42 @@ impl HelperClient for MockHelper {
                     "uri": uri,
                     "base_dn": base_dn,
                     "bind_dn": bind_dn,
-                    "tls": tls
+                    "tls": tls,
+                    "ca_cert_path": ca_cert_path,
+                    "nss_enabled": nss_enabled,
+                    "pam_enabled": pam_enabled
                 }),
+            },
+            HelperOperation::ValidateDirectoryService {
+                provider, domain, ..
+            } => HelperResponse {
+                ok: true,
+                category: "directory_service".into(),
+                target: if domain.is_empty() { provider } else { domain },
+                message: "mock directory service validation passed".into(),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::JoinActiveDirectory {
+                domain, username, ..
+            } => HelperResponse {
+                ok: true,
+                category: "directory_service".into(),
+                target: domain,
+                message: format!("mock Active Directory join requested for {username}"),
+                data: serde_json::json!({}),
+            },
+            HelperOperation::LeaveActiveDirectory {
+                domain, username, ..
+            } => HelperResponse {
+                ok: true,
+                category: "directory_service".into(),
+                target: domain,
+                message: if let Some(username) = username {
+                    format!("mock Active Directory leave requested for {username}")
+                } else {
+                    "mock Active Directory leave requested".into()
+                },
+                data: serde_json::json!({}),
             },
             HelperOperation::ListSmartDisks => HelperResponse {
                 ok: true,
@@ -894,6 +951,7 @@ impl FreeBsdCommandBuilder {
                 uri,
                 base_dn,
                 bind_dn,
+                ca_cert_path,
                 ..
             } => {
                 safe_arg(provider)?;
@@ -904,8 +962,57 @@ impl FreeBsdCommandBuilder {
                     if let Some(bind_dn) = bind_dn {
                         safe_arg(bind_dn)?;
                     }
+                    if let Some(ca_cert_path) = ca_cert_path {
+                        safe_arg(ca_cert_path)?;
+                    }
                 }
                 vec!["service".into(), "nslcd".into(), "restart".into()]
+            }
+            HelperOperation::ValidateDirectoryService {
+                provider,
+                domain,
+                uri,
+                tls,
+                ca_cert_path,
+            } => {
+                safe_arg(provider)?;
+                safe_arg(domain)?;
+                if let Some(ca_cert_path) = ca_cert_path {
+                    safe_arg(ca_cert_path)?;
+                }
+                match provider.as_str() {
+                    "ldap" => build_ldap_validation_command(uri, *tls, ca_cert_path.as_deref())?,
+                    "active_directory" => vec!["net".into(), "ads".into(), "testjoin".into()],
+                    _ => {
+                        return Err(HelperError::Rejected(
+                            "directory provider must be ldap or active_directory".into(),
+                        ))
+                    }
+                }
+            }
+            HelperOperation::JoinActiveDirectory {
+                domain, username, ..
+            } => {
+                safe_arg(domain)?;
+                safe_arg(username)?;
+                vec![
+                    "net".into(),
+                    "ads".into(),
+                    "join".into(),
+                    "-U".into(),
+                    username.clone(),
+                ]
+            }
+            HelperOperation::LeaveActiveDirectory {
+                domain, username, ..
+            } => {
+                safe_arg(domain)?;
+                let mut cmd = vec!["net".into(), "ads".into(), "leave".into()];
+                if let Some(username) = username {
+                    safe_arg(username)?;
+                    cmd.extend(["-U".into(), username.clone()]);
+                }
+                cmd
             }
             HelperOperation::ListSmartDisks => vec!["smartctl".into(), "--scan".into()],
             HelperOperation::StartSmartTest {
@@ -1609,6 +1716,7 @@ fn render_nslcd_conf(
     base_dn: &str,
     bind_dn: Option<&str>,
     tls: bool,
+    ca_cert_path: Option<&str>,
 ) -> String {
     let mut lines = vec![
         "# Managed by bnasmgr".to_string(),
@@ -1640,7 +1748,117 @@ fn render_nslcd_conf(
     } else {
         "tls_reqcert allow".into()
     });
+    if let Some(ca_cert_path) = ca_cert_path.filter(|value| !value.is_empty()) {
+        lines.push(format!("tls_cacertfile {ca_cert_path}"));
+    }
     lines.push(String::new());
+    lines.join("\n")
+}
+
+fn build_ldap_validation_command(
+    uri: &str,
+    tls: bool,
+    ca_cert_path: Option<&str>,
+) -> Result<Vec<String>, HelperError> {
+    let (scheme, host, port) = parse_ldap_endpoint(uri)?;
+    if scheme == "ldaps" || tls {
+        let mut command = vec![
+            "openssl".into(),
+            "s_client".into(),
+            "-connect".into(),
+            format!("{host}:{port}"),
+            "-servername".into(),
+            host,
+            "-verify_return_error".into(),
+            "-brief".into(),
+        ];
+        if let Some(ca_cert_path) = ca_cert_path.filter(|value| !value.is_empty()) {
+            command.extend(["-CAfile".into(), ca_cert_path.into()]);
+        }
+        if scheme == "ldap" {
+            command.splice(2..2, ["-starttls".into(), "ldap".into()]);
+        }
+        Ok(command)
+    } else {
+        Ok(vec!["service".into(), "nslcd".into(), "status".into()])
+    }
+}
+
+fn parse_ldap_endpoint(uri: &str) -> Result<(&'static str, String, u16), HelperError> {
+    let (scheme, rest, default_port) = if let Some(rest) = uri.strip_prefix("ldaps://") {
+        ("ldaps", rest, 636)
+    } else if let Some(rest) = uri.strip_prefix("ldap://") {
+        ("ldap", rest, 389)
+    } else {
+        return Err(HelperError::Rejected(
+            "directory URI must start with ldap:// or ldaps://".into(),
+        ));
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.contains('[') {
+        return Err(HelperError::Rejected("invalid LDAP URI host".into()));
+    }
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| HelperError::Rejected("invalid LDAP URI port".into()))?;
+        (host, port)
+    } else {
+        (authority, default_port)
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+    {
+        return Err(HelperError::Rejected("invalid LDAP URI host".into()));
+    }
+    Ok((scheme, host.to_string(), port))
+}
+
+fn render_nsswitch_conf(enabled: bool) -> String {
+    let identity_sources = if enabled { "files ldap" } else { "files" };
+    [
+        "# Managed by bnasmgr",
+        &format!("group: {identity_sources}"),
+        "group_compat: nis",
+        "hosts: files dns",
+        "networks: files",
+        &format!("passwd: {identity_sources}"),
+        "passwd_compat: nis",
+        "shells: files",
+        "services: compat",
+        "services_compat: nis",
+        "protocols: files",
+        "rpc: files",
+        "",
+    ]
+    .join("\n")
+}
+
+fn render_pam_system_conf(enabled: bool) -> String {
+    let mut lines = vec![
+        "# Managed by bnasmgr".to_string(),
+        "auth sufficient pam_opie.so no_warn no_fake_prompts".into(),
+        "auth requisite pam_opieaccess.so no_warn allow_local".into(),
+        "auth sufficient pam_unix.so no_warn try_first_pass nullok".into(),
+    ];
+    if enabled {
+        lines.push("auth sufficient /usr/local/lib/pam_ldap.so no_warn try_first_pass".into());
+    }
+    lines.extend([
+        "auth required pam_deny.so".into(),
+        "account required pam_login_access.so".into(),
+        "account required pam_unix.so".into(),
+    ]);
+    if enabled {
+        lines.push("account sufficient /usr/local/lib/pam_ldap.so".into());
+    }
+    lines.extend([
+        "session required pam_lastlog.so no_fail".into(),
+        "password required pam_unix.so no_warn try_first_pass".into(),
+        String::new(),
+    ]);
     lines.join("\n")
 }
 
@@ -1670,6 +1888,15 @@ impl HelperClient for FreeBsdHelper {
             }
             HelperOperation::ApplyDirectoryServiceSettings { .. } => {
                 return freebsd_directory_service_settings(&operation).await
+            }
+            HelperOperation::ValidateDirectoryService { .. } => {
+                return freebsd_validate_directory_service(&operation).await
+            }
+            HelperOperation::JoinActiveDirectory { .. } => {
+                return freebsd_join_active_directory(&operation).await
+            }
+            HelperOperation::LeaveActiveDirectory { .. } => {
+                return freebsd_leave_active_directory(&operation).await
             }
             HelperOperation::ListSmartDisks => return freebsd_smart_disks().await,
             HelperOperation::ListSmartSelfTests { .. } => {
@@ -2097,6 +2324,9 @@ async fn freebsd_directory_service_settings(
         base_dn,
         bind_dn,
         tls,
+        ca_cert_path,
+        nss_enabled,
+        pam_enabled,
     } = operation
     else {
         return Err(HelperError::Rejected(
@@ -2117,9 +2347,28 @@ async fn freebsd_directory_service_settings(
             base_dn,
             bind_dn.as_deref(),
             *tls,
+            ca_cert_path.as_deref(),
         ),
     )
     .await?;
+    let nsswitch_path = if *nss_enabled {
+        let path = std::env::var("BNASMGR_NSSWITCH_CONF")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/etc/nsswitch.conf"));
+        atomic_write(&path, &render_nsswitch_conf(*enabled)).await?;
+        Some(path)
+    } else {
+        None
+    };
+    let pam_system_path = if *pam_enabled {
+        let path = std::env::var("BNASMGR_PAM_SYSTEM_CONF")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/etc/pam.d/system"));
+        atomic_write(&path, &render_pam_system_conf(*enabled)).await?;
+        Some(path)
+    } else {
+        None
+    };
     let output = run_command(FreeBsdCommandBuilder::build(operation)?).await?;
     let (category, target) = operation_category_target(operation);
     Ok(HelperResponse {
@@ -2131,7 +2380,97 @@ async fn freebsd_directory_service_settings(
         } else {
             output.stderr
         },
-        data: serde_json::json!({ "status": output.status, "config_path": config_path }),
+        data: serde_json::json!({
+            "status": output.status,
+            "config_path": config_path,
+            "nsswitch_path": nsswitch_path,
+            "pam_system_path": pam_system_path,
+        }),
+    })
+}
+
+async fn freebsd_validate_directory_service(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let output = run_command(FreeBsdCommandBuilder::build(operation)?).await?;
+    let (category, target) = operation_category_target(operation);
+    Ok(HelperResponse {
+        ok: output.ok,
+        category,
+        target,
+        message: if output.ok {
+            "directory service validation passed".into()
+        } else {
+            output.stderr
+        },
+        data: serde_json::json!({ "status": output.status }),
+    })
+}
+
+async fn freebsd_join_active_directory(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::JoinActiveDirectory {
+        domain,
+        username,
+        password,
+    } = operation
+    else {
+        return Err(HelperError::Rejected(
+            "expected Active Directory join operation".into(),
+        ));
+    };
+    let mut stdin = password.clone();
+    stdin.push('\n');
+    let output =
+        run_command_with_stdin(FreeBsdCommandBuilder::build(operation)?, stdin.as_bytes()).await?;
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "directory_service".into(),
+        target: domain.clone(),
+        message: if output.ok {
+            format!("Active Directory join requested for {username}")
+        } else {
+            output.stderr
+        },
+        data: serde_json::json!({ "status": output.status }),
+    })
+}
+
+async fn freebsd_leave_active_directory(
+    operation: &HelperOperation,
+) -> Result<HelperResponse, HelperError> {
+    let HelperOperation::LeaveActiveDirectory {
+        domain,
+        username,
+        password,
+    } = operation
+    else {
+        return Err(HelperError::Rejected(
+            "expected Active Directory leave operation".into(),
+        ));
+    };
+    let output = if let Some(password) = password {
+        let mut stdin = password.clone();
+        stdin.push('\n');
+        run_command_with_stdin(FreeBsdCommandBuilder::build(operation)?, stdin.as_bytes()).await?
+    } else {
+        run_command(FreeBsdCommandBuilder::build(operation)?).await?
+    };
+    Ok(HelperResponse {
+        ok: output.ok,
+        category: "directory_service".into(),
+        target: domain.clone(),
+        message: if output.ok {
+            if let Some(username) = username {
+                format!("Active Directory leave requested for {username}")
+            } else {
+                "Active Directory leave requested".into()
+            }
+        } else {
+            output.stderr
+        },
+        data: serde_json::json!({ "status": output.status }),
     })
 }
 
@@ -3670,6 +4009,9 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
         HelperOperation::ExecuteUpsShutdown { .. } => ("ups".into(), "shutdown".into()),
         HelperOperation::ApplyDirectoryServiceSettings {
             provider, domain, ..
+        }
+        | HelperOperation::ValidateDirectoryService {
+            provider, domain, ..
         } => (
             "directory_service".into(),
             if domain.is_empty() {
@@ -3678,6 +4020,10 @@ pub fn operation_category_target(operation: &HelperOperation) -> (String, String
                 domain.clone()
             },
         ),
+        HelperOperation::JoinActiveDirectory { domain, .. }
+        | HelperOperation::LeaveActiveDirectory { domain, .. } => {
+            ("directory_service".into(), domain.clone())
+        }
         HelperOperation::ListSmartDisks => ("disk_health".into(), "all".into()),
         HelperOperation::StartSmartTest { device, .. }
         | HelperOperation::ListSmartSelfTests { device, .. } => {
@@ -4063,6 +4409,9 @@ mod tests {
             base_dn: "dc=example,dc=test".into(),
             bind_dn: Some("cn=readonly,dc=example,dc=test".into()),
             tls: true,
+            ca_cert_path: Some("/usr/local/etc/ssl/certs/directory-ca.pem".into()),
+            nss_enabled: true,
+            pam_enabled: true,
         })
         .unwrap();
         assert_eq!(cmd, vec!["service", "nslcd", "restart"]);
@@ -4074,14 +4423,112 @@ mod tests {
             "dc=example,dc=test",
             Some("cn=readonly,dc=example,dc=test"),
             true,
+            Some("/usr/local/etc/ssl/certs/directory-ca.pem"),
         );
         assert!(rendered.contains("uri ldaps://directory.example.test"));
         assert!(rendered.contains("base dc=example,dc=test"));
         assert!(rendered.contains("binddn cn=readonly,dc=example,dc=test"));
         assert!(rendered.contains("ssl on"));
         assert!(rendered.contains("tls_reqcert demand"));
+        assert!(rendered.contains("tls_cacertfile /usr/local/etc/ssl/certs/directory-ca.pem"));
+        assert!(render_nsswitch_conf(true).contains("passwd: files ldap"));
+        assert!(render_nsswitch_conf(false).contains("passwd: files"));
+        assert!(render_pam_system_conf(true).contains("/usr/local/lib/pam_ldap.so"));
+        assert!(!render_pam_system_conf(false).contains("/usr/local/lib/pam_ldap.so"));
+        let ldap_validation =
+            FreeBsdCommandBuilder::build(&HelperOperation::ValidateDirectoryService {
+                provider: "ldap".into(),
+                domain: "example.test".into(),
+                uri: "ldap://directory.example.test".into(),
+                tls: false,
+                ca_cert_path: None,
+            })
+            .unwrap();
+        assert_eq!(ldap_validation, vec!["service", "nslcd", "status"]);
+        let ldap_tls_validation =
+            FreeBsdCommandBuilder::build(&HelperOperation::ValidateDirectoryService {
+                provider: "ldap".into(),
+                domain: "example.test".into(),
+                uri: "ldap://directory.example.test:1389".into(),
+                tls: true,
+                ca_cert_path: Some("/usr/local/etc/ssl/certs/directory-ca.pem".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            ldap_tls_validation,
+            vec![
+                "openssl",
+                "s_client",
+                "-starttls",
+                "ldap",
+                "-connect",
+                "directory.example.test:1389",
+                "-servername",
+                "directory.example.test",
+                "-verify_return_error",
+                "-brief",
+                "-CAfile",
+                "/usr/local/etc/ssl/certs/directory-ca.pem"
+            ]
+        );
+        let ldaps_validation =
+            FreeBsdCommandBuilder::build(&HelperOperation::ValidateDirectoryService {
+                provider: "ldap".into(),
+                domain: "example.test".into(),
+                uri: "ldaps://directory.example.test".into(),
+                tls: true,
+                ca_cert_path: None,
+            })
+            .unwrap();
+        assert_eq!(
+            ldaps_validation,
+            vec![
+                "openssl",
+                "s_client",
+                "-connect",
+                "directory.example.test:636",
+                "-servername",
+                "directory.example.test",
+                "-verify_return_error",
+                "-brief"
+            ]
+        );
+        let ad_validation =
+            FreeBsdCommandBuilder::build(&HelperOperation::ValidateDirectoryService {
+                provider: "active_directory".into(),
+                domain: "example.test".into(),
+                uri: "ldaps://directory.example.test".into(),
+                tls: true,
+                ca_cert_path: None,
+            })
+            .unwrap();
+        assert_eq!(ad_validation, vec!["net", "ads", "testjoin"]);
+        let ad_join = FreeBsdCommandBuilder::build(&HelperOperation::JoinActiveDirectory {
+            domain: "example.test".into(),
+            username: "join-admin".into(),
+            password: "not-in-argv".into(),
+        })
+        .unwrap();
+        assert_eq!(ad_join, vec!["net", "ads", "join", "-U", "join-admin"]);
+        assert!(!ad_join.iter().any(|arg| arg.contains("not-in-argv")));
+        let ad_leave = FreeBsdCommandBuilder::build(&HelperOperation::LeaveActiveDirectory {
+            domain: "example.test".into(),
+            username: Some("join-admin".into()),
+            password: Some("not-in-argv".into()),
+        })
+        .unwrap();
+        assert_eq!(ad_leave, vec!["net", "ads", "leave", "-U", "join-admin"]);
+        assert!(!ad_leave.iter().any(|arg| arg.contains("not-in-argv")));
+        let ad_leave_without_credentials =
+            FreeBsdCommandBuilder::build(&HelperOperation::LeaveActiveDirectory {
+                domain: "example.test".into(),
+                username: None,
+                password: None,
+            })
+            .unwrap();
+        assert_eq!(ad_leave_without_credentials, vec!["net", "ads", "leave"]);
 
-        let disabled = render_nslcd_conf(false, "ldap", "", "", "", None, false);
+        let disabled = render_nslcd_conf(false, "ldap", "", "", "", None, false, None);
         assert!(disabled.contains("directory service disabled"));
 
         let err = FreeBsdCommandBuilder::build(&HelperOperation::ApplyDirectoryServiceSettings {
@@ -4092,6 +4539,9 @@ mod tests {
             base_dn: "dc=example,dc=test".into(),
             bind_dn: None,
             tls: true,
+            ca_cert_path: None,
+            nss_enabled: false,
+            pam_enabled: false,
         })
         .unwrap_err();
         assert!(err.to_string().contains("unsafe command argument"));

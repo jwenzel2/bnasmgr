@@ -131,11 +131,39 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
   await directoryForm.getByPlaceholder('ldap://directory.example.test').fill('ldaps://directory.example.test');
   await directoryForm.getByPlaceholder('dc=example,dc=test').fill('dc=example,dc=test');
   await directoryForm.getByPlaceholder('bind DN, optional').fill('cn=readonly,dc=example,dc=test');
+  await directoryForm.getByPlaceholder('/usr/local/etc/ssl/certs/directory-ca.pem').fill('/usr/local/etc/ssl/certs/directory-ca.pem');
+  await directoryForm.getByLabel('Wire NSS identity lookup').check();
+  await directoryForm.getByLabel('Wire PAM authentication').check();
   const saveDirectoryResponse = page.waitForResponse((response) =>
     response.url().endsWith('/api/system/directory-service') && response.request().method() === 'POST'
   );
   await directoryForm.getByRole('button', { name: 'Save directory service' }).click();
   await expect((await saveDirectoryResponse).ok()).toBeTruthy();
+  const validateDirectoryResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/directory-service/validate') && response.request().method() === 'POST'
+  );
+  await page.getByRole('button', { name: 'Validate directory service' }).click();
+  await expect((await validateDirectoryResponse).ok()).toBeTruthy();
+  await directoryForm.getByRole('combobox').selectOption('active_directory');
+  const saveAdDirectoryResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/directory-service') && response.request().method() === 'POST'
+  );
+  await directoryForm.getByRole('button', { name: 'Save directory service' }).click();
+  await expect((await saveAdDirectoryResponse).ok()).toBeTruthy();
+  await page.getByPlaceholder('AD join username').fill('join-admin');
+  await page.getByPlaceholder('AD join password').fill('supersecret');
+  const joinAdResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/directory-service/join') && response.request().method() === 'POST'
+  );
+  await page.getByRole('button', { name: 'Join Active Directory' }).click();
+  await expect((await joinAdResponse).ok()).toBeTruthy();
+  await page.getByPlaceholder('AD join username').fill('join-admin');
+  await page.getByPlaceholder('AD join password').fill('leavesecret');
+  const leaveAdResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/api/system/directory-service/leave') && response.request().method() === 'POST'
+  );
+  await page.getByRole('button', { name: 'Leave Active Directory' }).click();
+  await expect((await leaveAdResponse).ok()).toBeTruthy();
   const sambaServiceCard = page.locator('article.card').filter({ has: page.getByRole('heading', { name: 'Samba', exact: true }) });
   await expect(sambaServiceCard).toContainText('running');
   await sambaServiceCard.getByRole('button', { name: 'Restart' }).click();
@@ -266,6 +294,9 @@ test('seeded admin can complete first login and browse dashboard sections', asyn
   await expect(page.getByRole('cell', { name: 'DNS resolver configuration saved' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'static route configuration saved' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'directory service settings saved' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'directory service validation completed' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'Active Directory join requested' }).first()).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'Active Directory leave requested' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'alert notification test queued for 1 channel(s)' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'configuration backup imported' }).first()).toBeVisible();
   await expect(page.getByRole('cell', { name: 'samba share deleted' }).first()).toBeVisible();

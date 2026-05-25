@@ -24,7 +24,7 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - UPS status monitoring through NUT `upsc ups@localhost`.
 - UPS policy settings for low charge/runtime thresholds and intended shutdown command.
 - Confirmed UPS shutdown execution through a typed helper operation limited to `shutdown -p|-h now|+minutes`.
-- Directory service settings for LDAP/Active Directory connection metadata, validation, audit, config backup/restore, helper-rendered `nslcd.conf`, and helper-owned `nslcd` restart application.
+- Directory service settings for LDAP/Active Directory connection metadata, CA trust path, validation, audit, config backup/restore, helper-rendered `nslcd.conf`, optional NSS/PAM wiring, helper-owned `nslcd` restart application, LDAP/Active Directory validation actions, and password-redacted Active Directory join/leave execution.
 - Pool scrub status plus start/stop controls.
 - SMART disk health inventory with self-test launch and history.
 - Computed alerts for degraded pools, unhealthy disks, stopped services, and failed helper operations.
@@ -43,7 +43,7 @@ The recovered MVP implementation plan is functionally complete in this repo:
 The next implementation track is modeled after common TrueNAS-style NAS administration:
 
 - Scheduled snapshot tasks with cadence and retention metadata.
-- Directory service NSS/PAM wiring and Active Directory join validation on target FreeBSD hosts.
+- Active Directory join/leave validation on target FreeBSD hosts.
 
 ## Verification Commands
 
@@ -62,6 +62,7 @@ The latest local verification passed with these commands.
 ## Still Left
 
 - Validate scheduled snapshot task execution and retention pruning on FreeBSD with a disposable dataset.
+- Validate optional directory service NSS/PAM wiring and Active Directory validation flow on an actual FreeBSD host with console rollback access.
 - Run the FreeBSD manual acceptance checklist on an actual FreeBSD host with a disposable ZFS pool/dataset.
 - Wire and validate Samba include fragments on the exact Samba package version installed on the target host.
 - Wire and validate NFS export fragment consumption before relying on generated exports in production.

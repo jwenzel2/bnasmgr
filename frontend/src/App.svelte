@@ -21,7 +21,8 @@
   let staticRoutes = [];
   let upsStatus = null;
   let upsPolicy = { enabled: false, low_charge_percent: 20, min_runtime_seconds: 300, shutdown_command: 'shutdown -p now' };
-  let directoryService = { enabled: false, provider: 'ldap', domain: '', uri: '', base_dn: '', bind_dn: '', tls: true };
+  let directoryService = { enabled: false, provider: 'ldap', domain: '', uri: '', base_dn: '', bind_dn: '', tls: true, ca_cert_path: '', nss_enabled: false, pam_enabled: false };
+  let activeDirectoryJoinForm = { username: '', password: '' };
   let sambaShares = [];
   let sambaSettings = { workgroup: 'WORKGROUP', server_string: 'bnasmgr NAS', netbios_name: 'BNASMGR', security: 'user', map_to_guest: 'Bad User', log_level: '1' };
   let sambaUsers = [];
@@ -435,6 +436,32 @@
       method: 'POST',
       body: JSON.stringify(directoryService)
     });
+  }
+
+  async function validateDirectoryService() {
+    await request('/api/system/directory-service/validate', { method: 'POST', body: JSON.stringify({}) });
+    await loadAudit();
+    await loadHelperHistory();
+  }
+
+  async function joinActiveDirectory() {
+    await request('/api/system/directory-service/join', {
+      method: 'POST',
+      body: JSON.stringify(activeDirectoryJoinForm)
+    });
+    activeDirectoryJoinForm = { username: '', password: '' };
+    await loadAudit();
+    await loadHelperHistory();
+  }
+
+  async function leaveActiveDirectory() {
+    await request('/api/system/directory-service/leave', {
+      method: 'POST',
+      body: JSON.stringify(activeDirectoryJoinForm)
+    });
+    activeDirectoryJoinForm = { username: '', password: '' };
+    await loadAudit();
+    await loadHelperHistory();
   }
 
   async function serviceAction(service, action) {
@@ -1216,9 +1243,23 @@
             <input bind:value={directoryService.uri} placeholder="ldap://directory.example.test" />
             <input bind:value={directoryService.base_dn} placeholder="dc=example,dc=test" />
             <input bind:value={directoryService.bind_dn} placeholder="bind DN, optional" />
+            <input bind:value={directoryService.ca_cert_path} placeholder="/usr/local/etc/ssl/certs/directory-ca.pem" />
             <label class="check"><input type="checkbox" bind:checked={directoryService.tls} /> TLS required</label>
+            <label class="check"><input type="checkbox" bind:checked={directoryService.nss_enabled} /> Wire NSS identity lookup</label>
+            <label class="check"><input type="checkbox" bind:checked={directoryService.pam_enabled} /> Wire PAM authentication</label>
             <button>Save directory service</button>
           </form>
+          <div class="actions">
+            <button disabled={!directoryService.enabled} on:click={validateDirectoryService}>Validate directory service</button>
+          </div>
+          {#if directoryService.provider === 'active_directory'}
+            <form class="stack" on:submit|preventDefault={joinActiveDirectory}>
+              <input bind:value={activeDirectoryJoinForm.username} placeholder="AD join username" />
+              <input bind:value={activeDirectoryJoinForm.password} type="password" placeholder="AD join password" />
+              <button disabled={!directoryService.enabled}>Join Active Directory</button>
+              <button type="button" disabled={!directoryService.enabled} on:click={leaveActiveDirectory}>Leave Active Directory</button>
+            </form>
+          {/if}
         </section>
         <section class="grid services-grid">
           {#each services as svc}

@@ -15,8 +15,8 @@ Automated coverage in this MVP includes:
 - SMART disk inventory, self-test launch validation, and self-test history parsing.
 - UPS status command construction, NUT `upsc` output parsing, and API exposure.
 - UPS policy persistence, validation, alert threshold handling, confirmed shutdown execution, and browser smoke coverage.
-- Directory service settings validation, persistence, helper command construction, config backup inclusion, audit coverage, and browser smoke coverage.
-- Directory service `nslcd.conf` rendering and helper-owned `nslcd` restart command construction.
+- Directory service settings validation, persistence, helper command construction, config backup inclusion, validation action, Active Directory join/leave actions, audit coverage, and browser smoke coverage.
+- Directory service `nslcd.conf` rendering including optional CA certificate trust path, optional NSS/PAM rendering, helper-owned `nslcd` restart command construction, LDAP/LDAPS certificate probe command construction, and Active Directory validation command construction.
 - Computed alerts for failed helper operations and live NAS health signals.
 - Alert notification channel settings validation, persistence, and test audit events.
 - Background alert notification scan deduplication and delivery history.
@@ -39,7 +39,7 @@ Automated coverage in this MVP includes:
 - Configuration backup import/export coverage with secret redaction.
 - Service status color mapping.
 - API first-login enforcement for privileged actions.
-- Browser smoke coverage for seeded-admin login, first-password-change, storage load, destructive dataset confirmation, snapshot file restore, snapshot task run, Samba/NFS/iSCSI share create/delete, UPS policy and confirmed shutdown execution, alert webhook/email notification settings and tests, directory service settings, configuration export/import including replace restore, service restart, log filtering, dashboard user management, audit persistence, and core dashboard navigation.
+- Browser smoke coverage for seeded-admin login, first-password-change, storage load, destructive dataset confirmation, snapshot file restore, snapshot task run, Samba/NFS/iSCSI share create/delete, UPS policy and confirmed shutdown execution, alert webhook/email notification settings and tests, directory service settings and validation, configuration export/import including replace restore, service restart, log filtering, dashboard user management, audit persistence, and core dashboard navigation.
 
 Manual smoke coverage:
 
