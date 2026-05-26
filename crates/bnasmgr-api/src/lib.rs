@@ -2579,7 +2579,7 @@ async fn leave_active_directory(
             HelperOperation::LeaveActiveDirectory {
                 domain: settings.domain.clone(),
                 username: (!body.username.trim().is_empty()).then(|| body.username.clone()),
-                password: (!body.password.is_empty()).then(|| body.password),
+                password: (!body.password.is_empty()).then_some(body.password),
             },
         )
         .await?;
@@ -3257,14 +3257,13 @@ fn validate_replication_task(body: &CreateReplicationTaskRequest) -> Result<(), 
         ));
     }
     match body.mode.as_str() {
-        "local" => {
-            if body.remote_host.as_deref().unwrap_or("").trim().len() > 0
-                || body.remote_user.as_deref().unwrap_or("").trim().len() > 0
-            {
-                return Err(ApiError::bad_request(
-                    "local replication must not include remote host or user",
-                ));
-            }
+        "local"
+            if !body.remote_host.as_deref().unwrap_or("").trim().is_empty()
+                || !body.remote_user.as_deref().unwrap_or("").trim().is_empty() =>
+        {
+            return Err(ApiError::bad_request(
+                "local replication must not include remote host or user",
+            ));
         }
         "remote" => {
             let host = body.remote_host.as_deref().unwrap_or("");
@@ -4690,9 +4689,9 @@ fn validate_alert_notification_settings(
             "SMTP TLS mode must be none, starttls, or tls",
         ));
     }
-    if !settings.webhook_url.is_empty()
-        && !(settings.webhook_url.starts_with("https://")
-            || settings.webhook_url.starts_with("http://"))
+    if !(settings.webhook_url.is_empty()
+        || settings.webhook_url.starts_with("https://")
+        || settings.webhook_url.starts_with("http://"))
     {
         return Err(ApiError::bad_request(
             "webhook URL must start with http:// or https://",

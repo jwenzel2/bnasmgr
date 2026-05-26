@@ -10,6 +10,8 @@ The backend defaults to mock helper mode so it can run on non-FreeBSD systems.
 cargo run -p bnasmgr-api
 ```
 
+Set `BNASMGR_HELPER_SOCKET` on the API to use an external helper process instead of the in-process mock backend. On FreeBSD, run `bnasmgr-helper` with `BNASMGR_HELPER_BACKEND=freebsd` and the same `BNASMGR_HELPER_SOCKET` path.
+
 The API listens on `127.0.0.1:8080` and stores SQLite data in `bnasmgr.db` unless overridden:
 
 ```sh
@@ -96,15 +98,17 @@ Local Unix users/groups and Samba storage users are managed separately from dash
 
 Dashboard admins can manage common Samba server settings such as workgroup, server string, NetBIOS name, security mode, guest mapping, and log level. The helper writes these as a Samba global fragment before reloading `samba_server`.
 
-Samba and NFS share application writes helper-owned config fragments atomically before service reload. The default FreeBSD fragment roots are `/usr/local/etc/bnasmgr/smb4.includes` and `/usr/local/etc/bnasmgr/exports.d`.
+Samba and NFS share application writes helper-owned config fragments atomically before service reload. The default FreeBSD fragment roots are `/usr/local/etc/bnasmgr/smb4.includes` and `/usr/local/etc/bnasmgr/exports.d`; override them with `BNASMGR_SAMBA_INCLUDE_DIR` and `BNASMGR_NFS_EXPORTS_DIR` for staged validation.
 
-iSCSI target application writes helper-owned `ctl.conf` fragments before reloading `ctld`. The default FreeBSD fragment root is `/usr/local/etc/bnasmgr/ctl.conf.d`; include those fragments from the host `ctl.conf` before relying on dashboard-managed targets.
+iSCSI target application writes helper-owned `ctl.conf` fragments before reloading `ctld`. The default FreeBSD fragment root is `/usr/local/etc/bnasmgr/ctl.conf.d`; override it with `BNASMGR_ISCSI_INCLUDE_DIR` and include those fragments from the host `ctl.conf` before relying on dashboard-managed targets.
 
 The log viewer supports service, severity, search text, and date-range filters. FreeBSD syslog-style timestamps are parsed using the current year.
 
-The alert notifier runs in the API process by default every five minutes. Set `BNASMGR_ALERT_NOTIFIER=off` to disable it or `BNASMGR_ALERT_NOTIFIER_SECONDS` to change the interval. `http://` and `https://` webhook URLs are POSTed directly, and email can be sent through SMTP with plain, STARTTLS, or implicit TLS transport. SMTP authentication uses AUTH PLAIN when a username and password are configured.
+The alert notifier runs in the API process by default every five minutes. Set `BNASMGR_ALERT_NOTIFIER=off` to disable it or `BNASMGR_ALERT_NOTIFIER_SECONDS` to change the interval; values below 30 seconds are ignored. `http://` and `https://` webhook URLs are POSTed directly, and email can be sent through SMTP with plain, STARTTLS, or implicit TLS transport. SMTP authentication uses AUTH PLAIN when a username and password are configured.
 
-Replication tasks are scanned by the API process by default every minute. Set `BNASMGR_REPLICATION_SCHEDULER=off` to disable it or `BNASMGR_REPLICATION_SCHEDULER_SECONDS` to change the interval. Each run creates a `repl-*` snapshot, uses the newest prior local `repl-*` snapshot as the incremental send base when one exists, and prunes older local replication snapshots by the task retention count.
+Snapshot tasks are scanned by the API process by default every minute. Set `BNASMGR_SNAPSHOT_SCHEDULER=off` to disable it or `BNASMGR_SNAPSHOT_SCHEDULER_SECONDS` to change the interval; values below 10 seconds are ignored.
+
+Replication tasks are also scanned by the API process by default every minute. Set `BNASMGR_REPLICATION_SCHEDULER=off` to disable it or `BNASMGR_REPLICATION_SCHEDULER_SECONDS` to change the interval; values below 10 seconds are ignored. Each run creates a `repl-*` snapshot, uses the newest prior local `repl-*` snapshot as the incremental send base when one exists, and prunes older local replication snapshots by the task retention count.
 
 Destructive snapshot delete and rollback calls require an `X-BNASMGR-CONFIRM` header matching the exact snapshot name, in addition to UI confirmation.
 

@@ -3,6 +3,7 @@
 Automated coverage in this MVP includes:
 
 - Helper command construction and unsafe-argument rejection.
+- Helper socket permission setting and stale non-socket path rejection coverage for the production split-privilege path.
 - Helper-mediated Samba and NFS reload command construction.
 - FreeBSD `zpool`, `zfs snapshot`, and service-status output parsing.
 - Service allowlist enforcement and quota value validation.
@@ -31,6 +32,7 @@ Automated coverage in this MVP includes:
 - Snapshot dataset/name validation and backend confirmation header enforcement for delete/rollback.
 - Snapshot clone command construction and diff output parsing.
 - Snapshot file search and selected-file restore validation.
+- Scheduled snapshot task cadence handling.
 - Replication task validation, persistence, listing, deletion, retention metadata, incremental base selection, and manual run path.
 - Scheduled replication task cadence handling.
 - Argon2id password hashing with legacy development-hash verification.
@@ -50,6 +52,7 @@ Manual smoke coverage:
 5. Open storage, snapshots, shares, services, logs, audit, and users.
 6. Create a snapshot in mock mode and confirm audit entries are written.
 7. Trigger service `start`, `stop`, and `restart` in mock mode.
-8. On FreeBSD, validate real helper command execution against a disposable ZFS dataset before using production pools.
+8. Confirm a launched helper socket is mode `0660` before wiring the production split-privilege path.
+9. On FreeBSD, validate real helper command execution against a disposable ZFS dataset before using production pools.
 
 See `docs/remaining-work.md` for the current handoff checklist and post-MVP work.

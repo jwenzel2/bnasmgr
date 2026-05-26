@@ -12,7 +12,7 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - Local Unix user/group listing and mutation through typed helper operations.
 - Operational configuration backup/restore for saved dashboard state with secret redaction.
 - SQLite persistence for dashboard users, sessions, Samba/NFS/iSCSI share metadata, Samba users, audit events, helper history, and settings.
-- Typed helper protocol over a Unix socket, with mock and FreeBSD backends.
+- Typed helper protocol over a Unix socket, with mock and FreeBSD backends and `0660` helper socket permissions for the production split-privilege path.
 - FreeBSD command construction/parsing for ZFS storage, snapshots, quotas, services, logs, Samba users, and Samba/NFS/iSCSI fragment application.
 - Dataset create, property update, and delete workflows for compression, atime, quota, reservation, and mountpoint controls.
 - Read-only system reporting for host, OS, uptime, CPU model/core count, memory, free memory, swap total, and load averages.
@@ -38,12 +38,12 @@ The recovered MVP implementation plan is functionally complete in this repo:
 - Replication tasks can be stored, manually run, and automatically run by the API scheduler for local and remote ZFS send/receive, with local incremental bases and replication snapshot retention.
 - FreeBSD deployment notes and manual smoke checklist.
 
-## Traditional NAS Feature Plan
+## Target-Host Validation Track
 
-The next implementation track is modeled after common TrueNAS-style NAS administration:
+The remaining track is target-host validation modeled after common TrueNAS-style NAS administration:
 
-- Scheduled snapshot tasks with cadence and retention metadata.
 - Active Directory join/leave validation on target FreeBSD hosts.
+- Scheduled snapshot and replication task execution against disposable ZFS datasets.
 
 ## Verification Commands
 
@@ -62,6 +62,7 @@ The latest local verification passed with these commands.
 ## Still Left
 
 - Validate scheduled snapshot task execution and retention pruning on FreeBSD with a disposable dataset.
+- Validate scheduled replication task execution, incremental base selection, and retention pruning on FreeBSD with disposable local and remote datasets.
 - Validate optional directory service NSS/PAM wiring and Active Directory validation flow on an actual FreeBSD host with console rollback access.
 - Run the FreeBSD manual acceptance checklist on an actual FreeBSD host with a disposable ZFS pool/dataset.
 - Wire and validate Samba include fragments on the exact Samba package version installed on the target host.

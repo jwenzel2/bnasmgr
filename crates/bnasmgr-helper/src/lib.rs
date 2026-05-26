@@ -1708,47 +1708,49 @@ fn static_route_value(route: &StaticRouteConfig) -> String {
     }
 }
 
-fn render_nslcd_conf(
+struct NslcdRenderSettings<'a> {
     enabled: bool,
-    provider: &str,
-    domain: &str,
-    uri: &str,
-    base_dn: &str,
-    bind_dn: Option<&str>,
+    provider: &'a str,
+    domain: &'a str,
+    uri: &'a str,
+    base_dn: &'a str,
+    bind_dn: Option<&'a str>,
     tls: bool,
-    ca_cert_path: Option<&str>,
-) -> String {
+    ca_cert_path: Option<&'a str>,
+}
+
+fn render_nslcd_conf(settings: &NslcdRenderSettings<'_>) -> String {
     let mut lines = vec![
         "# Managed by bnasmgr".to_string(),
-        format!("# provider {provider}"),
+        format!("# provider {}", settings.provider),
     ];
-    if !enabled {
+    if !settings.enabled {
         lines.push("# directory service disabled".into());
         lines.push(String::new());
         return lines.join("\n");
     }
     lines.extend([
-        format!("# domain {domain}"),
-        format!("uri {uri}"),
-        format!("base {base_dn}"),
+        format!("# domain {}", settings.domain),
+        format!("uri {}", settings.uri),
+        format!("base {}", settings.base_dn),
     ]);
-    if let Some(bind_dn) = bind_dn.filter(|value| !value.is_empty()) {
+    if let Some(bind_dn) = settings.bind_dn.filter(|value| !value.is_empty()) {
         lines.push(format!("binddn {bind_dn}"));
     }
-    if uri.starts_with("ldaps://") {
+    if settings.uri.starts_with("ldaps://") {
         lines.push("ssl on".into());
     } else {
         lines.push("ssl off".into());
-        if tls {
+        if settings.tls {
             lines.push("tls_start_tls yes".into());
         }
     }
-    lines.push(if tls {
+    lines.push(if settings.tls {
         "tls_reqcert demand".into()
     } else {
         "tls_reqcert allow".into()
     });
-    if let Some(ca_cert_path) = ca_cert_path.filter(|value| !value.is_empty()) {
+    if let Some(ca_cert_path) = settings.ca_cert_path.filter(|value| !value.is_empty()) {
         lines.push(format!("tls_cacertfile {ca_cert_path}"));
     }
     lines.push(String::new());
@@ -2339,16 +2341,16 @@ async fn freebsd_directory_service_settings(
         .unwrap_or_else(|_| PathBuf::from("/usr/local/etc/nslcd.conf"));
     atomic_write(
         &config_path,
-        &render_nslcd_conf(
-            *enabled,
+        &render_nslcd_conf(&NslcdRenderSettings {
+            enabled: *enabled,
             provider,
             domain,
             uri,
             base_dn,
-            bind_dn.as_deref(),
-            *tls,
-            ca_cert_path.as_deref(),
-        ),
+            bind_dn: bind_dn.as_deref(),
+            tls: *tls,
+            ca_cert_path: ca_cert_path.as_deref(),
+        }),
     )
     .await?;
     let nsswitch_path = if *nss_enabled {
@@ -2753,17 +2755,17 @@ async fn freebsd_apply_share_fragment(
             let file = dir.join(format!("{}.conf", safe_file_stem(name)?));
             atomic_write(
                 &file,
-                &render_iscsi_target(
+                &render_iscsi_target(&IscsiTargetRender {
                     name,
                     portal_group,
-                    initiator_name.as_deref(),
+                    initiator_name: initiator_name.as_deref(),
                     auth_group,
                     extent_name,
                     path,
-                    size.as_deref(),
-                    *lun_id,
-                    *readonly,
-                ),
+                    size: size.as_deref(),
+                    lun_id: *lun_id,
+                    readonly: *readonly,
+                }),
             )
             .await?;
         }
@@ -3197,45 +3199,47 @@ fn render_nfs_export(path: &str, clients: &str, options: &str) -> String {
     format!("{path} {options} {clients}\n")
 }
 
-fn render_iscsi_target(
-    name: &str,
-    portal_group: &str,
-    initiator_name: Option<&str>,
-    auth_group: &str,
-    extent_name: &str,
-    path: &str,
-    size: Option<&str>,
+struct IscsiTargetRender<'a> {
+    name: &'a str,
+    portal_group: &'a str,
+    initiator_name: Option<&'a str>,
+    auth_group: &'a str,
+    extent_name: &'a str,
+    path: &'a str,
+    size: Option<&'a str>,
     lun_id: u32,
     readonly: bool,
-) -> String {
+}
+
+fn render_iscsi_target(target: &IscsiTargetRender<'_>) -> String {
     let mut lines = vec![
-        format!("portal-group {portal_group} {{"),
+        format!("portal-group {} {{", target.portal_group),
         "    discovery-auth-group no-authentication".into(),
         "    listen 0.0.0.0".into(),
         "}".into(),
         String::new(),
-        format!("extent {extent_name} {{"),
-        format!("    path {path}"),
+        format!("extent {} {{", target.extent_name),
+        format!("    path {}", target.path),
     ];
-    if let Some(size) = size.filter(|value| !value.is_empty()) {
+    if let Some(size) = target.size.filter(|value| !value.is_empty()) {
         lines.push(format!("    size {size}"));
     }
-    if readonly {
+    if target.readonly {
         lines.push("    option readonly on".into());
     }
     lines.extend([
         "}".into(),
         String::new(),
-        format!("target {name} {{"),
-        format!("    auth-group {auth_group}"),
-        format!("    portal-group {portal_group}"),
+        format!("target {} {{", target.name),
+        format!("    auth-group {}", target.auth_group),
+        format!("    portal-group {}", target.portal_group),
     ]);
-    if let Some(initiator_name) = initiator_name.filter(|value| !value.is_empty()) {
+    if let Some(initiator_name) = target.initiator_name.filter(|value| !value.is_empty()) {
         lines.push(format!("    initiator-name {initiator_name}"));
     }
     lines.extend([
-        format!("    lun {lun_id} {{"),
-        format!("        extent {extent_name}"),
+        format!("    lun {} {{", target.lun_id),
+        format!("        extent {}", target.extent_name),
         "    }".into(),
         "}".into(),
         String::new(),
@@ -4415,16 +4419,16 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cmd, vec!["service", "nslcd", "restart"]);
-        let rendered = render_nslcd_conf(
-            true,
-            "ldap",
-            "example.test",
-            "ldaps://directory.example.test",
-            "dc=example,dc=test",
-            Some("cn=readonly,dc=example,dc=test"),
-            true,
-            Some("/usr/local/etc/ssl/certs/directory-ca.pem"),
-        );
+        let rendered = render_nslcd_conf(&NslcdRenderSettings {
+            enabled: true,
+            provider: "ldap",
+            domain: "example.test",
+            uri: "ldaps://directory.example.test",
+            base_dn: "dc=example,dc=test",
+            bind_dn: Some("cn=readonly,dc=example,dc=test"),
+            tls: true,
+            ca_cert_path: Some("/usr/local/etc/ssl/certs/directory-ca.pem"),
+        });
         assert!(rendered.contains("uri ldaps://directory.example.test"));
         assert!(rendered.contains("base dc=example,dc=test"));
         assert!(rendered.contains("binddn cn=readonly,dc=example,dc=test"));
@@ -4528,7 +4532,16 @@ mod tests {
             .unwrap();
         assert_eq!(ad_leave_without_credentials, vec!["net", "ads", "leave"]);
 
-        let disabled = render_nslcd_conf(false, "ldap", "", "", "", None, false, None);
+        let disabled = render_nslcd_conf(&NslcdRenderSettings {
+            enabled: false,
+            provider: "ldap",
+            domain: "",
+            uri: "",
+            base_dn: "",
+            bind_dn: None,
+            tls: false,
+            ca_cert_path: None,
+        });
         assert!(disabled.contains("directory service disabled"));
 
         let err = FreeBsdCommandBuilder::build(&HelperOperation::ApplyDirectoryServiceSettings {
@@ -4800,17 +4813,17 @@ mod tests {
         let nfs = render_nfs_export("/mnt/tank/media", "192.168.1.0/24", "-maproot=root");
         assert_eq!(nfs, "/mnt/tank/media -maproot=root 192.168.1.0/24\n");
 
-        let iscsi = render_iscsi_target(
-            "iqn.2026-05.local.bnasmgr:disk0",
-            "pg0",
-            None,
-            "no-authentication",
-            "disk0",
-            "/dev/zvol/tank/iscsi/disk0",
-            Some("10G"),
-            0,
-            true,
-        );
+        let iscsi = render_iscsi_target(&IscsiTargetRender {
+            name: "iqn.2026-05.local.bnasmgr:disk0",
+            portal_group: "pg0",
+            initiator_name: None,
+            auth_group: "no-authentication",
+            extent_name: "disk0",
+            path: "/dev/zvol/tank/iscsi/disk0",
+            size: Some("10G"),
+            lun_id: 0,
+            readonly: true,
+        });
         assert!(iscsi.contains("target iqn.2026-05.local.bnasmgr:disk0"));
         assert!(iscsi.contains("extent disk0"));
         assert!(iscsi.contains("path /dev/zvol/tank/iscsi/disk0"));

@@ -10,11 +10,19 @@ This MVP uses a split privilege model:
 
 ## Packages and Services
 
-Install the platform components used by the dashboard:
+Install the baseline platform components used by the dashboard:
 
 ```sh
 pkg install sqlite3 samba419 rust npm nginx
 ```
+
+Install optional host integrations for the features you plan to validate:
+
+```sh
+pkg install smartmontools nut openldap26-client nss-pam-ldapd
+```
+
+Directory service package names can vary by FreeBSD quarterly branch and site policy. Validate the installed LDAP/NSS/PAM tooling on the target host before enabling dashboard-managed directory authentication.
 
 Enable the storage and sharing services that match the host role:
 
@@ -51,7 +59,7 @@ Suggested installation layout:
 ```text
 /usr/local/sbin/bnasmgr-api
 /usr/local/sbin/bnasmgr-helper
-/usr/local/etc/bnasmgr/bnasmgr.db
+/var/db/bnasmgr/bnasmgr.db
 /usr/local/etc/bnasmgr/smb4.includes
 /usr/local/etc/bnasmgr/exports.d
 /usr/local/www/bnasmgr
@@ -60,7 +68,54 @@ Suggested installation layout:
 
 The helper socket should be owned by root and a dedicated group such as `bnasmgr`, with write access only for the API service account.
 
-## rc.d Service
+Create the service account, group, persistent configuration directory, and runtime socket directory before starting services:
+
+```sh
+pw groupadd bnasmgr
+pw useradd bnasmgr -g bnasmgr -d /nonexistent -s /usr/sbin/nologin -c "bnasmgr API"
+install -d -o root -g bnasmgr -m 2750 /var/run/bnasmgr
+install -d -o bnasmgr -g bnasmgr -m 0750 /var/db/bnasmgr
+install -d -o root -g wheel -m 0755 /usr/local/etc/bnasmgr
+```
+
+The SQLite database belongs under `/var/db/bnasmgr` so the unprivileged API can create the database and SQLite journal files without being able to write helper-managed service fragments. The helper-managed config root under `/usr/local/etc/bnasmgr` stays root-owned.
+
+The helper sets the socket mode to `0660` after binding. The setgid bit on `/var/run/bnasmgr` keeps the recreated socket in the `bnasmgr` group, while the directory mode prevents the API service account from replacing entries in that directory.
+
+For production FreeBSD operation, run `bnasmgr-helper` with `BNASMGR_HELPER_BACKEND=freebsd` and set the same `BNASMGR_HELPER_SOCKET` path for both `bnasmgr-helper` and `bnasmgr-api`. If `BNASMGR_HELPER_SOCKET` is omitted, the API uses the in-process mock helper backend for development.
+
+## rc.d Services
+
+Create `/usr/local/etc/rc.d/bnasmgr_helper` for the privileged helper:
+
+```sh
+#!/bin/sh
+
+# PROVIDE: bnasmgr_helper
+# REQUIRE: NETWORKING zfs
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="bnasmgr_helper"
+rcvar="bnasmgr_helper_enable"
+command="/usr/sbin/daemon"
+procname="/usr/local/sbin/bnasmgr-helper"
+pidfile="/var/run/${name}.pid"
+command_args="-p ${pidfile} ${procname}"
+start_precmd="${name}_prestart"
+
+bnasmgr_helper_prestart()
+{
+    install -d -o root -g bnasmgr -m 2750 /var/run/bnasmgr
+}
+
+load_rc_config $name
+: ${bnasmgr_helper_enable:="NO"}
+: ${bnasmgr_helper_env:="BNASMGR_HELPER_BACKEND=freebsd BNASMGR_HELPER_SOCKET=/var/run/bnasmgr/helper.sock"}
+
+run_rc_command "$1"
+```
 
 Create `/usr/local/etc/rc.d/bnasmgr`:
 
@@ -68,36 +123,50 @@ Create `/usr/local/etc/rc.d/bnasmgr`:
 #!/bin/sh
 
 # PROVIDE: bnasmgr
-# REQUIRE: NETWORKING zfs
+# REQUIRE: NETWORKING zfs bnasmgr_helper
 # KEYWORD: shutdown
 
 . /etc/rc.subr
 
 name="bnasmgr"
 rcvar="bnasmgr_enable"
-command="/usr/local/sbin/bnasmgr-api"
+command="/usr/sbin/daemon"
+procname="/usr/local/sbin/bnasmgr-api"
 bnasmgr_user="bnasmgr"
 pidfile="/var/run/${name}.pid"
-command_args="--daemon"
+command_args="-p ${pidfile} -u ${bnasmgr_user} ${procname}"
+start_precmd="${name}_prestart"
+
+bnasmgr_prestart()
+{
+    install -d -o bnasmgr -g bnasmgr -m 0750 /var/db/bnasmgr
+}
 
 load_rc_config $name
 : ${bnasmgr_enable:="NO"}
-: ${bnasmgr_env:="BNASMGR_DATABASE_URL=sqlite:///usr/local/etc/bnasmgr/bnasmgr.db?mode=rwc BNASMGR_BIND=127.0.0.1:8080"}
+: ${bnasmgr_env:="BNASMGR_DATABASE_URL=sqlite:///var/db/bnasmgr/bnasmgr.db?mode=rwc BNASMGR_BIND=127.0.0.1:8080 BNASMGR_HELPER_SOCKET=/var/run/bnasmgr/helper.sock"}
 
 run_rc_command "$1"
 ```
 
-Then enable it:
+Then enable them:
 
 ```sh
+chmod 555 /usr/local/etc/rc.d/bnasmgr_helper
 chmod 555 /usr/local/etc/rc.d/bnasmgr
+sysrc bnasmgr_helper_enable=YES
 sysrc bnasmgr_enable=YES
+service bnasmgr_helper start
 service bnasmgr start
 ```
 
-The daemon flag is a deployment placeholder for the rc script. If supervised directly by `daemon(8)` or another runner, adapt `command_args` accordingly.
+The rc.d examples use `daemon(8)` to supervise the foreground Rust binaries. If you use another supervisor, keep the same environment variables and helper socket permissions.
 
 Snapshot task scheduling is enabled in the API process by default. Set `BNASMGR_SNAPSHOT_SCHEDULER=off` to disable it, or set `BNASMGR_SNAPSHOT_SCHEDULER_SECONDS=60` to control how often the API scans for due tasks. Values below 10 seconds are ignored.
+
+Replication task scheduling is also enabled in the API process by default. Set `BNASMGR_REPLICATION_SCHEDULER=off` to disable it, or set `BNASMGR_REPLICATION_SCHEDULER_SECONDS=60` to control the scan interval. Values below 10 seconds are ignored.
+
+Alert notification delivery is enabled by default and scans every five minutes. Set `BNASMGR_ALERT_NOTIFIER=off` to disable it, or set `BNASMGR_ALERT_NOTIFIER_SECONDS=300` to change the scan interval. Values below 30 seconds are ignored.
 
 ## HTTPS
 
@@ -136,8 +205,9 @@ This is the preferred production layout when serving the built Svelte files from
 The Rust API can also bind HTTPS directly when a certificate and key are configured:
 
 ```sh
-BNASMGR_DATABASE_URL='sqlite:///usr/local/etc/bnasmgr/bnasmgr.db?mode=rwc' \
+BNASMGR_DATABASE_URL='sqlite:///var/db/bnasmgr/bnasmgr.db?mode=rwc' \
 BNASMGR_BIND=0.0.0.0:8443 \
+BNASMGR_HELPER_SOCKET=/var/run/bnasmgr/helper.sock \
 BNASMGR_TLS_CERT=/usr/local/etc/ssl/bnasmgr/fullchain.pem \
 BNASMGR_TLS_KEY=/usr/local/etc/ssl/bnasmgr/privkey.pem \
 /usr/local/sbin/bnasmgr-api
@@ -148,8 +218,9 @@ If using direct TLS, either serve the frontend through a separate HTTPS static f
 To serve the built Svelte frontend directly from `bnasmgr-api`, set `BNASMGR_STATIC_DIR` to the directory containing `index.html`. Unknown non-API routes fall back to `index.html` for client-side routing, while unknown `/api/*` routes still return JSON 404 responses:
 
 ```sh
-BNASMGR_DATABASE_URL='sqlite:///usr/local/etc/bnasmgr/bnasmgr.db?mode=rwc' \
+BNASMGR_DATABASE_URL='sqlite:///var/db/bnasmgr/bnasmgr.db?mode=rwc' \
 BNASMGR_BIND=0.0.0.0:8443 \
+BNASMGR_HELPER_SOCKET=/var/run/bnasmgr/helper.sock \
 BNASMGR_TLS_CERT=/usr/local/etc/ssl/bnasmgr/fullchain.pem \
 BNASMGR_TLS_KEY=/usr/local/etc/ssl/bnasmgr/privkey.pem \
 BNASMGR_STATIC_DIR=/usr/local/www/bnasmgr \
@@ -161,7 +232,7 @@ BNASMGR_STATIC_DIR=/usr/local/www/bnasmgr \
 For direct API TLS in the rc.d service, include the TLS paths in `bnasmgr_env`:
 
 ```sh
-: ${bnasmgr_env:="BNASMGR_DATABASE_URL=sqlite:///usr/local/etc/bnasmgr/bnasmgr.db?mode=rwc BNASMGR_BIND=0.0.0.0:8443 BNASMGR_TLS_CERT=/usr/local/etc/ssl/bnasmgr/fullchain.pem BNASMGR_TLS_KEY=/usr/local/etc/ssl/bnasmgr/privkey.pem"}
+: ${bnasmgr_env:="BNASMGR_DATABASE_URL=sqlite:///var/db/bnasmgr/bnasmgr.db?mode=rwc BNASMGR_BIND=0.0.0.0:8443 BNASMGR_HELPER_SOCKET=/var/run/bnasmgr/helper.sock BNASMGR_TLS_CERT=/usr/local/etc/ssl/bnasmgr/fullchain.pem BNASMGR_TLS_KEY=/usr/local/etc/ssl/bnasmgr/privkey.pem"}
 ```
 
 For nginx TLS termination, keep `BNASMGR_BIND=127.0.0.1:8080` and omit `BNASMGR_TLS_CERT` and `BNASMGR_TLS_KEY`.
@@ -171,9 +242,17 @@ For nginx TLS termination, keep `BNASMGR_BIND=127.0.0.1:8080` and omit `BNASMGR_
 The helper allowlist covers:
 
 - ZFS dataset, quota, and snapshot operations.
+- ZFS pool scrub status and start/stop operations.
+- Local and remote ZFS replication send/receive operations.
+- Read-only host, network interface, UPS, SMART, and log inventory.
+- Network interface, DNS resolver, and static route configuration.
 - Service status and `start`, `stop`, `restart` through `service(8)`.
 - Samba metadata and password-management integration points.
 - NFS export metadata integration points.
+- iSCSI `ctl.conf` fragment integration points.
+- Local Unix user/group management through `pw(8)`.
+- Directory service validation, `nslcd.conf` rendering, optional NSS/PAM file rendering, and Active Directory join/leave commands.
+- UPS shutdown execution through a restricted `shutdown(8)` command shape.
 - Log reads from known system log locations.
 
 Arguments are passed as process arguments, not shell strings. Inputs containing shell-control characters are rejected before command construction.
@@ -194,6 +273,10 @@ Share application now uses helper-owned fragments:
 - Override these with `BNASMGR_SAMBA_INCLUDE_DIR` and `BNASMGR_NFS_EXPORTS_DIR` in the helper environment.
 
 Wire Samba by including the generated fragment set from `smb4.conf` according to the Samba version installed on the host. Wire NFS by configuring the system export workflow to consume the generated export fragments before `mountd` reloads. The helper writes each fragment through a temporary file and atomic rename before reloading the relevant service.
+
+iSCSI target metadata is persisted by the API and applied through typed helper operations. The FreeBSD command backend writes helper-owned `ctl.conf` fragments under `/usr/local/etc/bnasmgr/ctl.conf.d` by default and reloads `ctld`. Override the fragment root with `BNASMGR_ISCSI_INCLUDE_DIR` in the helper environment for staged validation.
+
+Replication tasks create task-owned `repl-*` snapshots, use the newest prior local `repl-*` snapshot as an incremental base when one exists, and prune older local replication snapshots by the configured retention count. Remote replication invokes `zfs send` locally and receives through `ssh <remote_user>@<remote_host> zfs receive`; validate SSH keys, dataset permissions, and receive targets on disposable datasets before enabling scheduled remote replication.
 
 ## Operational Safety
 
